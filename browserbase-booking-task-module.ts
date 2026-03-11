@@ -220,15 +220,25 @@ function buildSteps(I: any): StepDef[] {
     step("Search by address").fill('th.address-field input, th[class*="address"] input', I.serviceAddress.split(",")[0].trim()).build(),
     step("Wait for search results").wait(10000).build(),
 
-    // FIX 1: Added console.log + waitForTimeout(5000) after click
     step("Check if customer found by address").custom(async (page: any, ctx: any) => {
       const rows = page.locator("table tbody tr"); const count = await rows.count();
       console.log(`    ℹ️  Found ${count} rows in customer table`);
       for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
         if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email) || t.includes(I.phone)) {
           console.log(`    ℹ️  Matched row ${i}: "${t.substring(0, 100)}..."`);
-          await row.locator("a").first().click();
-          await page.waitForTimeout(5000); // FIX: wait for navigation to customer profile
+          // Extract customer ID from the row text (first number in the row is the ID)
+          const idMatch = t.match(/^(\d+)/);
+          if (idMatch) {
+            const customerId = idMatch[1];
+            const url = `https://misterquik.sera.tech/customers/${customerId}`;
+            console.log(`    ℹ️  Navigating to: ${url}`);
+            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+          } else {
+            // Fallback: click the first link in that row area using page-level selector
+            console.log(`    ℹ️  No ID found in text, clicking first link in row ${i}...`);
+            await page.locator(`table tbody tr:nth-child(${i + 1}) a`).first().click();
+          }
+          await page.waitForTimeout(5000);
           ctx.customerFound = true; return;
         }
       } ctx.customerFound = false;
@@ -243,15 +253,19 @@ function buildSteps(I: any): StepDef[] {
     }).build(),
     step("Wait for phone search results").skipIf((_p: any, c: any) => c.customerFound).wait(10000).build(),
 
-    // FIX 2: Added console.log + waitForTimeout(5000) after click
     step("Check if customer found by phone").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
       const rows = page.locator("table tbody tr"); const count = await rows.count();
       console.log(`    ℹ️  Phone search: ${count} rows`);
       for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
         if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email)) {
           console.log(`    ℹ️  Matched row ${i} by phone`);
-          await row.locator("a").first().click();
-          await page.waitForTimeout(5000); // FIX: wait for navigation
+          const idMatch = t.match(/^(\d+)/);
+          if (idMatch) {
+            await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+          } else {
+            await page.locator(`table tbody tr:nth-child(${i + 1}) a`).first().click();
+          }
+          await page.waitForTimeout(5000);
           ctx.customerFound = true; return;
         }
       }
@@ -266,15 +280,19 @@ function buildSteps(I: any): StepDef[] {
     }).build(),
     step("Wait for email search results").skipIf((_p: any, c: any) => c.customerFound).wait(10000).build(),
 
-    // FIX 3: Added console.log + waitForTimeout(5000) after click
     step("Check if customer found by email").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
       const rows = page.locator("table tbody tr"); const count = await rows.count();
       console.log(`    ℹ️  Email search: ${count} rows`);
       for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
         if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email)) {
           console.log(`    ℹ️  Matched row ${i} by email`);
-          await row.locator("a").first().click();
-          await page.waitForTimeout(5000); // FIX: wait for navigation
+          const idMatch = t.match(/^(\d+)/);
+          if (idMatch) {
+            await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+          } else {
+            await page.locator(`table tbody tr:nth-child(${i + 1}) a`).first().click();
+          }
+          await page.waitForTimeout(5000);
           ctx.customerFound = true; return;
         }
       }
