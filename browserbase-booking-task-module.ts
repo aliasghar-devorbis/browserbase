@@ -104,6 +104,36 @@ function step(n: string) { return new StepBuilder(n); }
 // --- Executor ---
 let stagehandRef: Stagehand;
 
+// Helper: wait for a selector to become visible (works with Stagehand's locators)
+async function waitForVisible(page: any, selector: string, timeoutMs = 10000) {
+  const start = Date.now();
+  // Handle comma-separated selectors (try each one)
+  const selectors = selector.split(",").map(s => s.trim());
+  while (Date.now() - start < timeoutMs) {
+    for (const sel of selectors) {
+      try {
+        const visible = await page.locator(sel).first().isVisible({ timeout: 1000 }).catch(() => false);
+        if (visible) return true;
+      } catch { /* ignore */ }
+    }
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`Timeout waiting for "${selector}" to be visible after ${timeoutMs}ms`);
+}
+
+// Helper: wait for a selector to become hidden
+async function waitForHidden(page: any, selector: string, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const visible = await page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false);
+      if (!visible) return true;
+    } catch { return true; }
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`Timeout waiting for "${selector}" to be hidden after ${timeoutMs}ms`);
+}
+
 async function execAction(page: any, action: any, ctx: any) {
   if (!action || action.type === "noop") return;
   const val = (v: any) => typeof v === "function" ? v(ctx) : v;
@@ -114,7 +144,13 @@ async function execAction(page: any, action: any, ctx: any) {
     case "type": await page.locator(action.selector).first().pressSequentially(val(action.value), { delay: action.options?.delay || 50 }); break;
     case "select": await page.locator(action.selector).first().selectOption(val(action.value)); break;
     case "press": await page.locator(action.selector).first().press(action.key); break;
-    case "waitFor": await page.locator(action.selector).first().waitFor({ state: action.state, timeout: 10000 }); break;
+    case "waitFor":
+      if (action.state === "hidden") {
+        await waitForHidden(page, action.selector, 10000);
+      } else {
+        await waitForVisible(page, action.selector, 10000);
+      }
+      break;
     case "wait": await page.waitForTimeout(action.ms); break;
     case "scroll":
       if (action.target === "bottom") await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -324,32 +360,34 @@ function buildSteps(I: any): StepDef[] {
     step("Fill customer email").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="email-primary"]', I.email).build(),
     step("Fill customer phone").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="phone"]', I.phone).build(),
     step("Fill service address with autocomplete").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const ai = page.locator("#address-search-service").first(); await ai.waitFor({ state: "visible", timeout: 10000 }); await ai.click(); await ai.fill(I.serviceAddress); await page.waitForTimeout(2000);
-      const fs = page.locator(".pac-item").first(); await fs.waitFor({ state: "visible", timeout: 5000 }); await fs.click();
+      const ai = page.locator("#address-search-service").first(); await waitForVisible(page, "#address-search-service", 10000); await ai.click(); await ai.fill(I.serviceAddress); await page.waitForTimeout(2000);
+      const fs = page.locator(".pac-item").first(); await waitForVisible(page, ".pac-item", 5000); await fs.click();
     }).build(),
     step("Wait for address selection").skipIf((_p: any, c: any) => c.customerFound).wait(1500).build(),
     step("Fill location name").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="location-name"]', I.locationName).build(),
     step("Select location type").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const dd = page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first(); await dd.waitFor({ state: "visible", timeout: 5000 }); await dd.click(); await page.waitForTimeout(500);
-      const opt = page.locator('[data-cy="location-type"] .select-options .option').filter({ hasText: I.locationType }).first(); await opt.waitFor({ state: "visible", timeout: 3000 }); await opt.click();
+      const dd = page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first(); await waitForVisible(page, '[data-cy="location-type"] input[data-cy="select-input-field"]', 5000); await dd.click(); await page.waitForTimeout(500);
+      const opt = page.locator('[data-cy="location-type"] .select-options .option').filter({ hasText: I.locationType }).first(); await waitForVisible(page, '[data-cy="location-type"] .select-options .option', 3000); await opt.click();
     }).build(),
     step("Scroll to bottom for tags").skipIf((_p: any, c: any) => c.customerFound).scroll("bottom").build(),
     step("Add customer tag").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
       await page.locator("i.tag-menu-btn").first().click(); await page.waitForTimeout(1000);
-      const ti = page.locator('sera-input input[placeholder="Create or Select Tag"]').first(); await ti.waitFor({ state: "visible", timeout: 5000 }); await ti.fill(I.customerTag); await page.waitForTimeout(2000);
+      const ti = page.locator('sera-input input[placeholder="Create or Select Tag"]').first(); await waitForVisible(page, 'sera-input input[placeholder="Create or Select Tag"]', 5000); await ti.fill(I.customerTag); await page.waitForTimeout(2000);
       await page.locator("span.tag-label").filter({ hasText: I.customerTag }).first().click(); await page.waitForTimeout(500);
     }).build(),
     step("Click Save & Schedule button").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
       await page.locator('button[data-cy="save-customer-continue"]').first().click();
-      try { await page.locator(".spinner, .loading, text=Loading").waitFor({ state: "hidden", timeout: 30000 }); } catch {}
+      try { await waitForHidden(page, ".spinner, .loading", 30000); } catch {}
       await page.waitForTimeout(2000); ctx.customerFound = true; ctx.newCustomerCreated = true; ctx.bookingPopupOpen = true;
     }).build(),
 
     // LOCATE ADDRESS
     step("Search for address in customer profile").skipIf((_p: any, c: any) => !c.customerFound || c.bookingPopupOpen).custom(async (page: any) => {
-      await page.locator(".addresses-cont").waitFor({ state: "visible", timeout: 15000 });
+      await waitForVisible(page, ".addresses-cont", 15000);
       const sn = extractStreetNumber(I.serviceAddress); const sa = I.serviceAddress.split(",")[0].trim();
-      const si = page.locator('sera-input[data-cy="address-search"] input').first(); await si.waitFor({ state: "visible", timeout: 5000 }); await si.fill(sn || sa); await page.waitForTimeout(1500);
+      await waitForVisible(page, 'sera-input[data-cy="address-search"] input', 5000);
+      const si = page.locator('sera-input[data-cy="address-search"] input').first();
+      await si.fill(sn || sa); await page.waitForTimeout(1500);
     }).build(),
 
     // FIX 5: Added logging + waitForTimeout(2000) after Schedule click
@@ -374,7 +412,7 @@ function buildSteps(I: any): StepDef[] {
       await page.getByText("Add Address", { exact: false }).first().click(); await page.waitForTimeout(1000);
     }).build(),
     step("Fill new address with autocomplete").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      const modal = page.locator('.modal, [role="dialog"]').filter({ hasText: "New Address" }).first(); await modal.waitFor({ state: "visible", timeout: 10000 });
+      const modal = page.locator('.modal, [role="dialog"]').filter({ hasText: "New Address" }).first(); await waitForVisible(page, '.modal, [role="dialog"]', 10000);
       const ai = modal.locator('input[type="text"]').first(); await ai.click(); await ai.fill(I.serviceAddress); await page.waitForTimeout(2000);
       const fs = page.locator(".pac-item").first();
       if (await fs.isVisible({ timeout: 3000 }).catch(() => false)) { await fs.click(); await page.waitForTimeout(1500); ctx.actualStreetAddress = await ai.inputValue(); }
@@ -396,7 +434,7 @@ function buildSteps(I: any): StepDef[] {
       ctx.addressFound = true; ctx.newAddressAdded = true;
     }).build(),
     step("Find newly added address and click Schedule").skipIf((_p: any, c: any) => !c.customerFound || !c.newAddressAdded || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      await page.locator(".addresses-cont").waitFor({ state: "visible", timeout: 10000 }); await page.waitForTimeout(1000);
+      await waitForVisible(page, ".addresses-cont", 10000); await page.waitForTimeout(1000);
       const raw = (ctx.actualStreetAddress || I.serviceAddress).split(",")[0].trim(); const sn = extractStreetNumber(raw);
       const si = page.locator('sera-input[data-cy="address-search"] input').first();
       if (await si.isVisible({ timeout: 2000 }).catch(() => false)) { await si.fill(sn || raw); await page.waitForTimeout(1500); }
@@ -414,7 +452,7 @@ function buildSteps(I: any): StepDef[] {
     // SERVICE CATEGORY
     step("Wait for service category select").waitFor('[data-cy="service-category-select"]', "visible").build(),
     step("Click service category input").custom(async (page: any) => {
-      const sc = page.locator('[data-cy="service-category-select"]').first(); await sc.waitFor({ state: "visible", timeout: 10000 });
+      const sc = page.locator('[data-cy="service-category-select"]').first(); await waitForVisible(page, '[data-cy="service-category-select"]', 10000);
       await sc.locator('[data-cy="select-input-field"], .ss-input-field, input').first().click();
     }).build(),
     step("Wait for dropdown").wait(500).build(),
@@ -437,7 +475,7 @@ function buildSteps(I: any): StepDef[] {
       await page.evaluate(() => { const m = document.querySelector('.modal-content, [role="dialog"]'); if (m) (m as any).scrollTop = 0; window.scrollTo(0, 0); }); await page.waitForTimeout(500);
       ctx.selectedDate = I.appointmentDateDay;
       for (const sel of ['[data-cy^="time-slot-"]', ".slot-button"]) {
-        try { await page.locator(sel).first().waitFor({ state: "visible", timeout: 15000 }); return; } catch {}
+        try { await waitForVisible(page, sel, 15000); return; } catch {}
       }
       throw new Error("Time slots never appeared after selecting date.");
     }).expect(async (_p: any, c: any) => ({ success: !!c.selectedDate })).build(),
