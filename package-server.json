@@ -1,0 +1,22 @@
+{
+  "name": "stratablue-booking-api",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx server.ts",
+    "dev": "npx tsx --watch server.ts",
+    "debug": "DEBUG=true npx tsx server.ts",
+    "task": "npx tsx browserbase-booking-task.ts"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^3.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  }
+}
