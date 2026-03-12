@@ -78,231 +78,6 @@ function extractHourFromDataCy(dc: string): number | null {
   return m ? parseInt(m[1], 10) : null;
 }
 
-// Month name → number mapping (0-indexed for JS Date, 1-indexed for comparison)
-const MONTH_NAMES: Record<string, number> = {
-  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
-  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
-};
-
-function monthNameToNumber(name: string): number {
-  return MONTH_NAMES[name.toLowerCase().trim()] || 0;
-}
-
-/**
- * Parse the currently displayed month/year from the calendar header.
- * Returns { month: 1-12, year: 4-digit } or null if unparseable.
- */
-async function getCalendarMonthYear(page: any): Promise<{ month: number; year: number } | null> {
-  const headerText: string = await page.evaluate(() => {
-    // Try common calendar header selectors in order of specificity
-    const selectors = [
-      ".fc-toolbar-title",
-      ".calendar-header",
-      ".month-title",
-      '[class*="calendar"] h1',
-      '[class*="calendar"] h2',
-      '[class*="calendar"] h3',
-      '[class*="month"]',
-      ".modal-content h1",
-      ".modal-content h2",
-      ".modal-content h3",
-      '[role="dialog"] h1',
-      '[role="dialog"] h2',
-      '[role="dialog"] h3',
-    ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && el.textContent?.trim()) return el.textContent.trim();
-    }
-    return "";
-  });
-
-  if (!headerText) return null;
-
-  // Match "Month YYYY" or "Month DD, YYYY" or "MM/YYYY" patterns
-  const monthYearMatch = headerText.match(/(\w+)\s+(\d{4})/);
-  if (monthYearMatch) {
-    const month = monthNameToNumber(monthYearMatch[1]);
-    const year = parseInt(monthYearMatch[2], 10);
-    if (month && year) return { month, year };
-  }
-
-  // Try "MM/YYYY"
-  const numericMatch = headerText.match(/(\d{1,2})\/(\d{4})/);
-  if (numericMatch) {
-    return { month: parseInt(numericMatch[1], 10), year: parseInt(numericMatch[2], 10) };
-  }
-
-  return null;
-}
-
-/**
- * Navigate the calendar to the target month/year by clicking next/prev arrows.
- * Returns true if successfully navigated.
- */
-async function navigateCalendarToMonth(
-  page: any,
-  targetMonth: number,
-  targetYear: number,
-  maxClicks = 36
-): Promise<boolean> {
-  for (let attempt = 0; attempt < maxClicks; attempt++) {
-    const current = await getCalendarMonthYear(page);
-    if (!current) {
-      console.log(`    ⚠️  Could not read calendar header on attempt ${attempt + 1}`);
-      await page.waitForTimeout(500);
-      continue;
-    }
-
-    const currentTotal = current.year * 12 + current.month;
-    const targetTotal  = targetYear * 12 + targetMonth;
-    const diff = targetTotal - currentTotal;
-
-    console.log(`    ℹ️  Calendar: ${current.month}/${current.year} → target: ${targetMonth}/${targetYear} (diff: ${diff})`);
-
-    if (diff === 0) {
-      console.log(`    ✅ Calendar is on correct month: ${targetMonth}/${targetYear}`);
-      return true;
-    }
-
-    // Click next or previous
-    const direction = diff > 0 ? "next" : "prev";
-    const clicked = await page.evaluate((dir: string) => {
-      // Try various next/prev button patterns
-      const nextSelectors = [
-        '.fc-next-button',
-        '[aria-label="next"]',
-        '[aria-label="Next"]',
-        '[aria-label="Next month"]',
-        '[aria-label="next month"]',
-        'button[class*="next"]',
-        'button[class*="forward"]',
-      ];
-      const prevSelectors = [
-        '.fc-prev-button',
-        '[aria-label="prev"]',
-        '[aria-label="Prev"]',
-        '[aria-label="Previous month"]',
-        '[aria-label="previous month"]',
-        'button[class*="prev"]',
-        'button[class*="back"]',
-      ];
-
-      const selectors = dir === "next" ? nextSelectors : prevSelectors;
-
-      for (const sel of selectors) {
-        const btn = document.querySelector(sel) as HTMLElement;
-        if (btn && btn.offsetParent !== null) {
-          btn.click();
-          return `css:${sel}`;
-        }
-      }
-
-      // Fallback: find button by text content
-      const textPatterns = dir === "next"
-        ? [">", "→", "▶", "»", "next"]
-        : ["<", "←", "◀", "«", "prev", "previous"];
-
-      const buttons = Array.from(document.querySelectorAll("button, [role='button']"));
-      for (const btn of buttons) {
-        const text = (btn as HTMLElement).textContent?.trim().toLowerCase() || "";
-        const label = (btn as HTMLElement).getAttribute("aria-label")?.toLowerCase() || "";
-        if (
-          textPatterns.some(p => text === p || label.includes(p)) &&
-          (btn as HTMLElement).offsetParent !== null
-        ) {
-          (btn as HTMLElement).click();
-          return `text:${text || label}`;
-        }
-      }
-      return null;
-    }, direction);
-
-    if (!clicked) {
-      console.log(`    ⚠️  Could not find ${direction} button on attempt ${attempt + 1}`);
-      // Try screenshot debug
-      if (DEBUG) await captureDebug(page, `nav_fail_${direction}_${attempt}`, 0);
-      // If we can't navigate, break
-      break;
-    }
-
-    await page.waitForTimeout(600);
-  }
-
-  const final = await getCalendarMonthYear(page);
-  return final?.month === targetMonth && final?.year === targetYear;
-}
-
-/**
- * Click a specific day number on the calendar, after navigating to the correct month.
- * This is the primary DOM-based date selection method.
- */
-async function domSelectDate(
-  page: any,
-  targetMonth: number,
-  targetYear: number,
-  targetDay: number
-): Promise<void> {
-  // Step 1: Navigate to correct month
-  const navigated = await navigateCalendarToMonth(page, targetMonth, targetYear);
-  if (!navigated) {
-    console.log(`    ⚠️  Calendar navigation may not have reached target month — attempting day click anyway`);
-  }
-
-  await page.waitForTimeout(500);
-
-  // Step 2: Click the target day
-  const dayStr = String(targetDay);
-  const paddedDay = dayStr.padStart(2, "0");
-
-  const dayClicked = await page.evaluate(([day, padded]: [string, string]) => {
-    // Strategy 1: data-cy attribute like "calendar-day-19" or "calendar-day-2026-12-19"
-    const byCy = Array.from(
-      document.querySelectorAll('[data-cy^="calendar-day-"]')
-    ).find(el => {
-      const dc = el.getAttribute("data-cy") || "";
-      return dc.endsWith(`-${day}`) || dc.endsWith(`-${padded}`);
-    }) as HTMLElement | null;
-    if (byCy) { byCy.click(); return `data-cy: ${byCy.getAttribute("data-cy")}`; }
-
-    // Strategy 2: data-date attribute like "2026-12-19" (FullCalendar)
-    const byDate = document.querySelector(`[data-date$="-${padded}"]`) as HTMLElement | null;
-    if (byDate && byDate.offsetParent !== null) { byDate.click(); return `data-date: ${byDate.getAttribute("data-date")}`; }
-
-    // Strategy 3: td with aria-label containing the day number
-    const byAria = Array.from(document.querySelectorAll("td[aria-label], [role='gridcell'][aria-label]"))
-      .find(el => {
-        const label = el.getAttribute("aria-label") || "";
-        // Match if label ends with the day number (e.g. "December 19, 2026")
-        return label.includes(` ${day},`) || label.includes(` ${day} `) || label.endsWith(` ${day}`);
-      }) as HTMLElement | null;
-    if (byAria && byAria.offsetParent !== null) { byAria.click(); return `aria-label: ${byAria.getAttribute("aria-label")}`; }
-
-    // Strategy 4: any td/button/div whose ONLY visible text content is exactly the day number
-    const candidates = Array.from(
-      document.querySelectorAll("td, .calendar-day, button.day, [class*='day-cell'], [class*='day-number']")
-    );
-    const exact = candidates.find(el => {
-      const text = el.textContent?.trim();
-      const isVisible = (el as HTMLElement).offsetParent !== null;
-      const isDisabled = el.hasAttribute("disabled") ||
-        el.classList.contains("disabled") ||
-        el.classList.contains("fc-day-other"); // FullCalendar "other month" days
-      return text === day && isVisible && !isDisabled;
-    }) as HTMLElement | null;
-    if (exact) { exact.click(); return `text-exact: ${exact.tagName}.${exact.className}`; }
-
-    return null;
-  }, [dayStr, paddedDay] as [string, string]);
-
-  if (!dayClicked) {
-    throw new Error(`Could not click day "${targetDay}" on calendar (month: ${targetMonth}/${targetYear})`);
-  }
-
-  console.log(`    ℹ️  Clicked day via: ${dayClicked}`);
-  await page.waitForTimeout(1000);
-}
-
 // =============================================================================
 // PAGE HELPERS — safe wrappers that use only documented Stagehand v3 API
 // =============================================================================
@@ -489,6 +264,7 @@ function buildSteps(I: any): Step[] {
       name: "Click login button",
       async run(page) {
         await page.waitForTimeout(1000);
+        // Use evaluate to find login button by text — avoids :has-text() pseudo-selector
         const clicked = await page.evaluate(() => {
           const keywords = ["sign in", "login", "log in"];
           const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(
@@ -501,6 +277,7 @@ function buildSteps(I: any): Step[] {
           return false;
         });
         if (!clicked) {
+          // Fallback to type=submit or .btn-primary
           const fallback = await firstVisible(page, ['input[type="submit"]', 'button[type="submit"]', ".btn-primary", "button.btn"], 3000);
           if (!fallback) throw new Error("Login button not found");
           await page.locator(fallback).first().click();
@@ -559,6 +336,7 @@ function buildSteps(I: any): Step[] {
             text.includes(I.phone)
           ) {
             console.log(`    ℹ️  Match at row ${i}`);
+            // Extract customer ID from row text (leading digits)
             const idMatch = text.match(/^(\d+)/);
             if (idMatch) {
               await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
@@ -566,6 +344,7 @@ function buildSteps(I: any): Step[] {
                 timeout: 30000,
               });
             } else {
+              // Fallback: click first link in that row via evaluate
               await clickNth(page, "table tbody tr a", i);
             }
             await page.waitForTimeout(5000);
@@ -685,6 +464,7 @@ function buildSteps(I: any): Step[] {
           console.log(`    ℹ️  Profile confirmed via: "${found}"`);
           return;
         }
+        // Check URL as fallback
         const url = await page.url();
         if (url.includes("/customers/") && !url.endsWith("/customers")) {
           console.log(`    ℹ️  Profile URL confirmed: ${url}`);
@@ -761,10 +541,12 @@ function buildSteps(I: any): Step[] {
       name: "Select location type",
       skipIf: (_, c) => alreadyFound(c),
       async run(page) {
+        // Open the dropdown — use flat CSS descendant selector (no chaining)
         await waitUntilVisible(page, '[data-cy="location-type"] input[data-cy="select-input-field"]', 5000);
         await page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first().click();
         await page.waitForTimeout(500);
         await waitUntilVisible(page, '[data-cy="location-type"] .select-options .option', 3000);
+        // Click matching option via evaluate
         await page.evaluate((locType: string) => {
           const options = Array.from(
             document.querySelectorAll('[data-cy="location-type"] .select-options .option')
@@ -791,6 +573,7 @@ function buildSteps(I: any): Step[] {
         await waitUntilVisible(page, 'sera-input input[placeholder="Create or Select Tag"]', 5000);
         await page.locator('sera-input input[placeholder="Create or Select Tag"]').first().fill(I.customerTag);
         await page.waitForTimeout(2000);
+        // Click matching tag label via evaluate
         await page.evaluate((tag: string) => {
           const labels = Array.from(document.querySelectorAll("span.tag-label"));
           const match = labels.find(el => el.textContent?.includes(tag)) as HTMLElement;
@@ -851,6 +634,7 @@ function buildSteps(I: any): Step[] {
 
         if (count === 0) { ctx.addressFound = false; return; }
 
+        // Get all card texts via evaluate
         const cardTexts: string[] = await page.evaluate(() =>
           Array.from(document.querySelectorAll(".address-card")).map(el => el.textContent || "")
         );
@@ -872,10 +656,12 @@ function buildSteps(I: any): Step[] {
 
         ctx.addressFound = true;
 
+        // Click the Schedule button inside the matched card via evaluate
         const clicked = await page.evaluate((idx: number) => {
           const cards = Array.from(document.querySelectorAll(".address-card"));
           const card = cards[idx];
           if (!card) return false;
+          // Try data-cy first, then any button/link with "Schedule" text
           const schedBtn =
             card.querySelector('[data-cy="address-schedule-link"]') ||
             Array.from(card.querySelectorAll("button, a")).find(el =>
@@ -897,6 +683,7 @@ function buildSteps(I: any): Step[] {
       name: "Open Address Actions dropdown",
       skipIf: (_, c) => addressFoundOrPopup(c),
       async run(page) {
+        // Clear search input
         const si = await firstVisible(page, ['sera-input[data-cy="address-search"] input'], 2000);
         if (si) {
           await page.locator(si).first().fill("");
@@ -910,6 +697,7 @@ function buildSteps(I: any): Step[] {
       name: "Click Add Address option",
       skipIf: (_, c) => addressFoundOrPopup(c),
       async run(page) {
+        // Use evaluate to find "Add Address" text anywhere
         const clicked = await page.evaluate(() => {
           const all = Array.from(document.querySelectorAll("*"));
           const el = all.find(
@@ -927,6 +715,7 @@ function buildSteps(I: any): Step[] {
       skipIf: (_, c) => addressFoundOrPopup(c),
       async run(page, ctx) {
         await waitUntilVisible(page, '.modal, [role="dialog"]', 10000);
+        // Find first text input inside the modal
         const modalInputSel = '.modal input[type="text"], [role="dialog"] input[type="text"]';
         await waitUntilVisible(page, modalInputSel, 5000);
         await page.locator(modalInputSel).first().click();
@@ -971,6 +760,7 @@ function buildSteps(I: any): Step[] {
       skipIf: (_, c) => addressFoundOrPopup(c),
       async run(page, ctx) {
         const modalSaveSel = '.modal button[type="submit"], [role="dialog"] button[type="submit"]';
+        // Use evaluate for robustness
         const saved = await page.evaluate(() => {
           const modal = document.querySelector('.modal, [role="dialog"]');
           if (!modal) return false;
@@ -981,6 +771,7 @@ function buildSteps(I: any): Step[] {
           return false;
         });
         if (!saved) {
+          // Fallback: try with locator
           await page.locator(modalSaveSel).first().click();
         }
         await page.waitForTimeout(2000);
@@ -998,6 +789,7 @@ function buildSteps(I: any): Step[] {
         const raw = ((ctx.actualStreetAddress || I.serviceAddress) as string).split(",")[0].trim();
         const sn = extractStreetNumber(raw);
 
+        // Fill search
         const siSel = 'sera-input[data-cy="address-search"] input';
         const siVisible = await page.locator(siSel).first().isVisible();
         if (siVisible) {
@@ -1031,6 +823,7 @@ function buildSteps(I: any): Step[] {
         if (!clicked) throw new Error(`Schedule button not in card ${matchedIndex}`);
         await page.waitForTimeout(2000);
 
+        // Verify modal opened
         await waitUntilVisible(page, '.modal, [role="dialog"], .booking-popup, .modal-content', 8000);
         ctx.bookingPopupOpen = true;
       },
@@ -1058,6 +851,7 @@ function buildSteps(I: any): Step[] {
     {
       name: "Open service category dropdown",
       async run(page) {
+        // Flat descendant selector — no chaining
         const inputSel = '[data-cy="service-category-select"] input[data-cy="select-input-field"], [data-cy="service-category-select"] .ss-input-field, [data-cy="service-category-select"] input';
         await waitUntilVisible(page, inputSel, 10000);
         await page.locator(inputSel).first().click();
@@ -1069,6 +863,8 @@ function buildSteps(I: any): Step[] {
     {
       name: "Select service category option",
       async run(page) {
+        const optionSel = '.ss-option, [role="option"], [class*="option"]';
+        // Try exact text match via evaluate
         const clicked = await page.evaluate((cat: string) => {
           const options = Array.from(document.querySelectorAll('.ss-option, [role="option"], [class*="option"]'));
           const exact = options.find(el => el.textContent?.trim() === cat) as HTMLElement;
@@ -1079,6 +875,7 @@ function buildSteps(I: any): Step[] {
         }, I.serviceCategory);
 
         if (!clicked) {
+          // Fallback: keyboard nav
           const inputSel = '[data-cy="service-category-select"] input[data-cy="select-input-field"], [data-cy="service-category-select"] input';
           await page.locator(inputSel).first().press("ArrowDown");
           await page.waitForTimeout(300);
@@ -1095,57 +892,99 @@ function buildSteps(I: any): Step[] {
     },
 
     // =========================================================================
-    // SELECT DATE
+    // SELECT DATE — try AI agent first, fall back to DOM click on quota error
     // =========================================================================
     {
       name: "Select date on calendar",
       async run(page, _ctx, stagehand) {
-        const targetMonth = monthNameToNumber(I.appointmentDateMonth);
-        const targetYear  = parseInt(String(I.appointmentDateYear || new Date().getFullYear()), 10);
-        const targetDay   = parseInt(String(I.appointmentDateDay), 10);
+        const domClickDate = async () => {
+          // Navigate to correct month if needed — click prev/next arrows
+          const targetMonth = I.appointmentDateMonth; // e.g. "March"
+          const targetDay   = String(I.appointmentDateDay);
 
-        // --- ALWAYS use DOM-first approach for date navigation ---
-        // The AI agent CUA approach is unreliable for multi-month navigation
-        // because it has a fixed step budget (10 steps) and wastes steps on reasoning.
-        // DOM navigation is deterministic, fast, and handles any month gap.
-
-        console.log(`    ℹ️  Target date: ${I.appointmentDateMonth} ${targetDay}, ${targetYear} (month#${targetMonth})`);
-
-        // Scroll down to ensure calendar is visible
-        await page.evaluate(() => {
-          const modal = document.querySelector('.modal-content, [role="dialog"]');
-          if (modal) modal.scrollTop = 300;
-          else window.scrollTo(0, 300);
-        });
-        await page.waitForTimeout(500);
-
-        try {
-          await domSelectDate(page, targetMonth, targetYear, targetDay);
-          console.log(`    ℹ️  DOM date selection succeeded`);
-        } catch (domErr: any) {
-          // DOM failed — try AI agent as fallback with generous step budget
-          console.log(`    ⚠️  DOM selection failed (${domErr.message}) — trying AI agent fallback`);
-          try {
-            const agent = stagehand.agent({
-              mode: "cua",
-              model: "google/gemini-2.5-computer-use-preview-10-2025",
-              options: { maxSteps: 50 }, // generous budget for far-future months
+          for (let nav = 0; nav < 3; nav++) {
+            // Check if current calendar header contains target month
+            const headerText: string = await page.evaluate(() => {
+              const h = document.querySelector(
+                '.fc-toolbar-title, .calendar-header, .month-title, ' +
+                'th.fc-col-header-cell, [class*="calendar"] h1, [class*="calendar"] h2, ' +
+                '[class*="calendar"] h3, [class*="month"]'
+              );
+              return h ? h.textContent || "" : document.body.textContent || "";
             });
-            await agent.execute(
-              `You are booking an appointment. A calendar is visible in the modal on screen.\n` +
-              `YOUR ONLY TASK: Navigate the calendar to ${I.appointmentDateMonth} ${targetYear}, ` +
-              `then click day ${targetDay}.\n` +
-              `CURRENT STATE: The calendar is currently showing some month. ` +
-              `You need to click the NEXT (→) arrow button repeatedly until you reach ` +
-              `${I.appointmentDateMonth} ${targetYear}, then click the cell with number "${targetDay}".\n` +
-              `IMPORTANT: Do NOT stop until you have clicked day ${targetDay} in ${I.appointmentDateMonth} ${targetYear}. ` +
-              `Do NOT click any other day. After clicking the day, time slots will appear — that means success. STOP then.`
-            );
-            console.log(`    ℹ️  AI agent fallback completed date selection`);
-          } catch (agentErr: any) {
-            throw new Error(
-              `Both DOM and AI agent date selection failed.\nDOM: ${domErr.message}\nAgent: ${agentErr.message}`
-            );
+
+            if (headerText.includes(targetMonth)) break;
+
+            // Click "next month" button
+            const nextClicked = await page.evaluate(() => {
+              const btn = (
+                document.querySelector('.fc-next-button, [aria-label="next"], [aria-label="Next"]') ||
+                Array.from(document.querySelectorAll("button")).find(
+                  b => b.textContent?.trim() === ">" || b.textContent?.trim() === "→" ||
+                       b.getAttribute("aria-label")?.toLowerCase().includes("next")
+                )
+              ) as HTMLElement | null;
+              if (btn) { btn.click(); return true; }
+              return false;
+            });
+            if (!nextClicked) break;
+            await page.waitForTimeout(800);
+          }
+
+          // Click the target day cell
+          const dayClicked = await page.evaluate((day: string) => {
+            // Try data-date attributes first (FullCalendar style)
+            const byCy = Array.from(
+              document.querySelectorAll('[data-cy^="calendar-day-"], [data-date], td.fc-daygrid-day, .calendar-day')
+            ).find(el => {
+              const dc  = el.getAttribute("data-cy") || "";
+              const dd  = el.getAttribute("data-date") || "";
+              const txt = el.textContent?.trim() || "";
+              return dc.endsWith(`-${day}`) || dd.endsWith(`-${day.padStart(2, "0")}`) || txt === day;
+            }) as HTMLElement | null;
+            if (byCy) { byCy.click(); return true; }
+
+            // Fallback: find any visible element whose trimmed text is exactly the day number
+            const byText = Array.from(document.querySelectorAll("td, .day, button")).find(el => {
+              const t = el.textContent?.trim();
+              return t === day && (el as HTMLElement).offsetParent !== null;
+            }) as HTMLElement | null;
+            if (byText) { byText.click(); return true; }
+            return false;
+          }, targetDay);
+
+          if (!dayClicked) throw new Error(`DOM fallback: could not click day "${targetDay}" on calendar`);
+          console.log(`    ℹ️  DOM fallback: clicked day ${targetDay}`);
+          await page.waitForTimeout(1000);
+        };
+
+        // --- Try AI agent ---
+        try {
+          const agent = stagehand.agent({
+            mode: "cua",
+            model: "google/gemini-2.5-computer-use-preview-10-2025",
+            options: { maxSteps: 30 },
+          });
+          await agent.execute(
+            `Look at the calendar in the booking modal. ` +
+            `Target Date: ${I.appointmentDate} (${I.appointmentDateMonth}, day ${I.appointmentDateDay}). ` +
+            `Scroll down to see the calendar, navigate to ${I.appointmentDateMonth} if needed, ` +
+            `then click ONLY day "${I.appointmentDateDay}". ` +
+            `Do NOT select any other date. STOP when time slots appear.`
+          );
+          console.log(`    ℹ️  AI agent completed date selection`);
+        } catch (agentErr: any) {
+          const isQuota =
+            agentErr?.message?.includes("429") ||
+            agentErr?.message?.includes("RESOURCE_EXHAUSTED") ||
+            agentErr?.message?.includes("quota");
+          if (isQuota) {
+            console.log(`    ⚠️  AI agent quota error — falling back to DOM date click`);
+            await domClickDate();
+          } else {
+            // Non-quota error: still try DOM fallback before giving up
+            console.log(`    ⚠️  AI agent error (${agentErr.message}) — trying DOM fallback`);
+            await domClickDate();
           }
         }
       },
@@ -1181,6 +1020,7 @@ function buildSteps(I: any): Step[] {
       async run(page, ctx) {
         await page.waitForTimeout(1000);
 
+        // Gather slot data via evaluate (getAttribute not available on locators)
         const slotData: Array<{ index: number; label: string; dataCy: string; classes: string }> =
           await page.evaluate(() =>
             Array.from(document.querySelectorAll('[data-cy^="time-slot-"]')).map((el, i) => ({
@@ -1223,6 +1063,7 @@ function buildSteps(I: any): Step[] {
           ctx.timeSlotDiffers = false;
         }
 
+        // Scroll into view then click via evaluate
         await page.evaluate((idx: number) => {
           const slots = Array.from(document.querySelectorAll('[data-cy^="time-slot-"]'));
           const el = slots[idx] as HTMLElement;
@@ -1241,6 +1082,7 @@ function buildSteps(I: any): Step[] {
       async run(page, ctx) {
         const selectedVisible = await page.locator('[data-cy^="time-slot-"].selected, .slot-button.selected').first().isVisible();
         if (!selectedVisible) {
+          // Click first available slot as fallback
           await page.locator('[data-cy^="time-slot-"]:not(.disabled)').first().click();
           await page.waitForTimeout(500);
           const label = await page.locator('[data-cy^="time-slot-"].selected, .slot-button.selected').first().textContent();
@@ -1290,6 +1132,7 @@ function buildSteps(I: any): Step[] {
       name: "Click Save (modal flow)",
       skipIf: (_, c) => !!c.newCustomerCreated,
       async run(page) {
+        // Try data-cy first, then find any visible Save/Submit button via evaluate
         const byCy = await page.locator('[data-cy="modal-submit-btn"]').first().isVisible();
         if (byCy) {
           await page.locator('[data-cy="modal-submit-btn"]').first().click();
@@ -1297,6 +1140,7 @@ function buildSteps(I: any): Step[] {
         }
 
         const clicked = await page.evaluate(() => {
+          // Look inside any open modal first
           const modal = document.querySelector('.modal-content, [role="dialog"], .booking-popup');
           const scope = modal || document;
           const btn = Array.from(scope.querySelectorAll('button, input[type="submit"]')).find(
@@ -1311,6 +1155,7 @@ function buildSteps(I: any): Step[] {
         });
 
         if (!clicked) {
+          // Last resort: click by type=submit
           await page.locator('button[type="submit"]').first().click();
         } else {
           console.log(`    ℹ️  Clicked save button: "${clicked}"`);
@@ -1353,14 +1198,7 @@ function buildSteps(I: any): Step[] {
       skipIf: (_, c) => !!c.newCustomerCreated,
       async run(page, ctx) {
         await page.waitForTimeout(1000);
-        // Modal should be gone after successful save
-        let modalVisible = false;
-        try {
-          modalVisible = await page.locator('.modal-content, [role="dialog"]').first().isVisible();
-        } catch {
-          modalVisible = false;
-        }
-
+        const modalVisible = await page.locator('.modal-content, [role="dialog"]').first().isVisible();
         if (modalVisible) {
           // Check for visible error messages
           const errText: string = await page.evaluate(() => {
@@ -1419,12 +1257,6 @@ export async function runBookingTask(input: any) {
     appointmentDate: input.appointmentDate || "Not Provided",
     appointmentDateDay: input.appointmentDateDay || "Not Provided",
     appointmentDateMonth: input.appointmentDateMonth || "Not Provided",
-    // NEW: year field — extracted from appointmentDate if not provided separately
-    appointmentDateYear: input.appointmentDateYear || (() => {
-      // Try to parse year from appointmentDate string e.g. "December 19, 2026"
-      const m = (input.appointmentDate || "").match(/\b(20\d{2})\b/);
-      return m ? parseInt(m[1], 10) : new Date().getFullYear();
-    })(),
     appointmentTime: input.appointmentTime || "Not Provided",
     createdAt: input.createdAt || "Not Provided",
     jobSummary: input.jobSummary || "Not Provided",
