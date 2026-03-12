@@ -242,7 +242,7 @@ function buildSteps(I: any): Step[] {
     {
       name: "Navigate to login page",
       async run(page) {
-        await page.goto("https://misterquik.sera.tech/admins/login", { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.goto("https://misterquik.sera.tech/admins/login", { waitUntil: "domcontentloaded", timeout: 100000 });
         await waitUntilVisible(page, 'input[type="email"], input[name="email"]', 15000);
       },
     },
@@ -306,7 +306,7 @@ function buildSteps(I: any): Step[] {
     {
       name: "Navigate to customers page",
       async run(page) {
-        await page.goto("https://misterquik.sera.tech/customers", { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.goto("https://misterquik.sera.tech/customers", { waitUntil: "domcontentloaded", timeout: 100000 });
         await waitUntilVisible(page, "table, .customers-list", 15000);
       },
     },
@@ -341,7 +341,7 @@ function buildSteps(I: any): Step[] {
             if (idMatch) {
               await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
                 waitUntil: "domcontentloaded",
-                timeout: 30000,
+                timeout: 100000,
               });
             } else {
               // Fallback: click first link in that row via evaluate
@@ -388,7 +388,7 @@ function buildSteps(I: any): Step[] {
             if (idMatch) {
               await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
                 waitUntil: "domcontentloaded",
-                timeout: 30000,
+                timeout: 100000,
               });
             } else {
               await clickNth(page, "table tbody tr a", i);
@@ -484,7 +484,7 @@ function buildSteps(I: any): Step[] {
       async run(page) {
         await page.goto("https://misterquik.sera.tech/customers/new", {
           waitUntil: "domcontentloaded",
-          timeout: 30000,
+          timeout: 100000,
         });
         await waitUntilVisible(page, 'input[data-cy="first-name"], input[name*="first" i]', 10000);
       },
