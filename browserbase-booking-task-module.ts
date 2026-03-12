@@ -1,20 +1,24 @@
 // browserbase-booking-task-module.ts
-// This is the same booking task, but exported as a callable function
-// so the server.ts can import and call it with dynamic inputs.
+// Complete rewrite — correct Stagehand v3 API, no broken locator patterns
+// Rules applied:
+//   - No locator.locator() chaining — all selectors are flat CSS strings
+//   - No locator.waitFor() — use waitUntilVisible() helper that polls isVisible() (no args)
+//   - No locator.getAttribute() — use page.evaluate()
+//   - No locator.scrollIntoViewIfNeeded() — use page.evaluate() scroll
+//   - locator.isVisible() takes NO arguments in Stagehand v3
+//   - page.waitForSelector() and page.waitForTimeout() exist on page
+//   - Complex interactions use page.evaluate() for bulletproof DOM access
 
 import { Stagehand } from "@browserbasehq/stagehand";
 import fs from "fs";
 
-// =============================================================================
-// All helpers (address normalization, time parsing, StepBuilder, executor)
-// are identical to your original task — I'm keeping them compact here.
-// The ONLY thing that changed is: inputs come from function args, not env vars.
-// =============================================================================
-
 const DEBUG = process.env.DEBUG === "true" || process.env.DEBUG === "1";
 const DEBUG_DIR = process.env.DEBUG_DIR || "./debug";
 
-// --- Address helpers ---
+// =============================================================================
+// HELPERS — Address & Time
+// =============================================================================
+
 function normalizeStreetAddress(address: string): string {
   if (!address) return "";
   let n = address.toLowerCase().trim().replace(/\s+/g, " ").replace(/\./g, "");
@@ -33,7 +37,8 @@ function normalizeStreetAddress(address: string): string {
 }
 
 function addressesMatch(a1: string, a2: string): boolean {
-  const n1 = normalizeStreetAddress(a1), n2 = normalizeStreetAddress(a2);
+  const n1 = normalizeStreetAddress(a1);
+  const n2 = normalizeStreetAddress(a2);
   return n1.includes(n2) || n2.includes(n1);
 }
 
@@ -41,115 +46,142 @@ function extractStreetNumber(address: string): string {
   return address.match(/^\d+/)?.[0] || "";
 }
 
-// --- Time helpers ---
 function parseRequestedTimeToHour(timeStr: string): number | null {
   if (!timeStr || timeStr === "Not Provided") return null;
   const norm = timeStr.toLowerCase().replace(/\s+/g, " ").trim();
   const m = norm.match(/(\d{1,2})(?::(\d{2}))?\s*(?:(am|pm))?\s*[-–to]+\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
   if (m) {
     let h = parseInt(m[1], 10);
-    const sap = m[3], eh = parseInt(m[4], 10), eap = m[6];
-    if (sap) { if (sap === "pm" && h < 12) h += 12; if (sap === "am" && h === 12) h = 0; }
-    else if (eap === "pm") {
+    const sap = m[3], eap = m[6], eh = parseInt(m[4], 10);
+    if (sap) {
+      if (sap === "pm" && h < 12) h += 12;
+      if (sap === "am" && h === 12) h = 0;
+    } else if (eap === "pm") {
       if (eh === 12) { if (h === 12) h = 0; }
-      else if (h > eh) { /* crosses noon */ }
-      else if (h === eh) { if (h < 12) h += 12; }
-      else { if (h < 12) h += 12; }
+      else if (h < 12) h += 12;
     } else if (eap === "am") {
-      if (eh === 12) { if (h < 12) h += 12; }
-      else if (h === 12) h = 0;
-      else if (h > eh) { if (h < 12) h += 12; }
-      else { if (h === 12) h = 0; }
+      if (h === 12) h = 0;
     }
     return h;
   }
   const sm = norm.match(/(\d{1,2})/);
-  if (sm) { let h = parseInt(sm[1], 10); if (norm.includes("pm") && h < 12) h += 12; return h; }
+  if (sm) {
+    let h = parseInt(sm[1], 10);
+    if (norm.includes("pm") && h < 12) h += 12;
+    return h;
+  }
   return null;
 }
 
 function extractHourFromDataCy(dc: string): number | null {
-  return dc?.match(/T(\d{2}):\d{2}:\d{2}/) ? parseInt(dc.match(/T(\d{2}):\d{2}:\d{2}/)![1], 10) : null;
+  const m = dc?.match(/T(\d{2}):\d{2}:\d{2}/);
+  return m ? parseInt(m[1], 10) : null;
 }
 
-// --- Step infrastructure (same as before, abbreviated for clarity) ---
-interface StepDef { name: string; action: any; validator: any; skipIf: any; onSuccess: any; timeout: number; }
+// =============================================================================
+// PAGE HELPERS — safe wrappers that use only documented Stagehand v3 API
+// =============================================================================
 
-class StepBuilder {
-  private _n: string; private _a: any = null; private _v: any = null;
-  private _s: any = null; private _o: any = null; private _t = 10000;
-  constructor(n: string) { this._n = n; }
-  goto(u: string) { this._a = { type: "goto", url: u }; return this; }
-  click(s: string) { this._a = { type: "click", selector: s }; return this; }
-  fill(s: string, v: any) { this._a = { type: "fill", selector: s, value: v }; return this; }
-  type(s: string, v: any, o: any = {}) { this._a = { type: "type", selector: s, value: v, options: o }; return this; }
-  select(s: string, v: any) { this._a = { type: "select", selector: s, value: v }; return this; }
-  press(s: string, k: string) { this._a = { type: "press", selector: s, key: k }; return this; }
-  waitFor(s: string, st = "visible") { this._a = { type: "waitFor", selector: s, state: st }; return this; }
-  wait(ms: number) { this._a = { type: "wait", ms }; return this; }
-  scroll(t = "bottom") { this._a = { type: "scroll", target: t }; return this; }
-  custom(fn: any) { this._a = { type: "custom", fn }; return this; }
-  ai(p: string) { this._a = { type: "ai", prompt: p }; return this; }
-  noop() { this._a = { type: "noop" }; return this; }
-  expectUrl(p: any) { this._v = { type: "url", pattern: p }; return this; }
-  expectVisible(s: string) { this._v = { type: "visible", selector: s }; return this; }
-  expectNotVisible(s: string) { this._v = { type: "notVisible", selector: s }; return this; }
-  expectText(t: string) { this._v = { type: "text", text: t }; return this; }
-  expectValue(s: string, v: any) { this._v = { type: "value", selector: s, value: v }; return this; }
-  expect(fn: any) { this._v = { type: "custom", fn }; return this; }
-  expectAi(p: string) { this._v = { type: "ai", prompt: p }; return this; }
-  skipIf(c: any) { this._s = c; return this; }
-  setContext(k: string, v: any) { this._o = { type: "setContext", key: k, value: v }; return this; }
-  captureContext(k: string, fn: any) { this._o = { type: "captureContext", key: k, fn }; return this; }
-  timeout(ms: number) { this._t = ms; return this; }
-  build(): StepDef { return { name: this._n, action: this._a, validator: this._v, skipIf: this._s, onSuccess: this._o, timeout: this._t }; }
-}
-function step(n: string) { return new StepBuilder(n); }
-
-// --- Executor ---
-let stagehandRef: Stagehand;
-
-async function execAction(page: any, action: any, ctx: any) {
-  if (!action || action.type === "noop") return;
-  const val = (v: any) => typeof v === "function" ? v(ctx) : v;
-  switch (action.type) {
-    case "goto": await page.goto(action.url, { waitUntil: "domcontentloaded", timeout: 30000 }); break;
-    case "click": await page.locator(action.selector).first().click({ timeout: 10000 }); break;
-    case "fill": await page.locator(action.selector).first().fill(val(action.value)); break;
-    case "type": await page.locator(action.selector).first().pressSequentially(val(action.value), { delay: action.options?.delay || 50 }); break;
-    case "select": await page.locator(action.selector).first().selectOption(val(action.value)); break;
-    case "press": await page.locator(action.selector).first().press(action.key); break;
-    case "waitFor": await page.locator(action.selector).first().waitFor({ state: action.state, timeout: 10000 }); break;
-    case "wait": await page.waitForTimeout(action.ms); break;
-    case "scroll":
-      if (action.target === "bottom") await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      else if (action.target === "top") await page.evaluate(() => window.scrollTo(0, 0));
-      else await page.locator(action.target).first().scrollIntoViewIfNeeded();
-      break;
-    case "custom": await action.fn(page, ctx); break;
-    case "ai":
-      const agent = stagehandRef.agent({ mode: "cua", model: "google/gemini-2.5-computer-use-preview-10-2025" });
-      await agent.execute(val(action.prompt));
-      break;
+/**
+ * Poll until selector is visible. locator.isVisible() takes NO args in Stagehand v3.
+ */
+async function waitUntilVisible(page: any, selector: string, timeoutMs = 10000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const visible = await page.locator(selector).first().isVisible();
+      if (visible) return true;
+    } catch { /* not ready yet */ }
+    await page.waitForTimeout(500);
   }
+  throw new Error(`Timeout (${timeoutMs}ms): "${selector}" never became visible`);
 }
 
-async function execValidator(page: any, v: any, ctx: any): Promise<any> {
-  if (!v) return { success: true };
-  try {
-    switch (v.type) {
-      case "url": { const u = await page.url(); const p = typeof v.pattern === "function" ? v.pattern(ctx) : v.pattern; return p instanceof RegExp ? { success: p.test(u) } : { success: u.includes(p) }; }
-      case "visible": return { success: await page.locator(v.selector).first().isVisible({ timeout: 5000 }).catch(() => false) };
-      case "notVisible": return { success: !(await page.locator(v.selector).first().isVisible({ timeout: 2000 }).catch(() => false)) };
-      case "text": return { success: await page.getByText(v.text).first().isVisible({ timeout: 5000 }).catch(() => false) };
-      case "value": { const iv = await page.locator(v.selector).first().inputValue(); return { success: iv === (typeof v.value === "function" ? v.value(ctx) : v.value) }; }
-      case "custom": return await v.fn(page, ctx);
-      case "ai": { const r = await stagehandRef.extract(typeof v.prompt === "function" ? v.prompt(ctx) : v.prompt); try { return typeof r === "object" ? r : JSON.parse(r as any); } catch { return { success: true, aiResponse: r }; } }
-      default: return { success: true };
-    }
-  } catch (e: any) { return { success: false, error: e.message }; }
+/**
+ * Poll until selector is hidden / gone.
+ */
+async function waitUntilHidden(page: any, selector: string, timeoutMs = 10000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const visible = await page.locator(selector).first().isVisible();
+      if (!visible) return true;
+    } catch { return true; /* element gone */ }
+    await page.waitForTimeout(500);
+  }
+  return false; // soft-fail — don't throw
 }
 
+/**
+ * Try multiple selectors, return the first one that is visible.
+ */
+async function firstVisible(page: any, selectors: string[], timeoutMs = 2000): Promise<string | null> {
+  for (const sel of selectors) {
+    try {
+      const visible = await page.locator(sel).first().isVisible();
+      if (visible) return sel;
+    } catch { /* try next */ }
+  }
+  // one retry pass with short wait
+  await page.waitForTimeout(timeoutMs);
+  for (const sel of selectors) {
+    try {
+      const visible = await page.locator(sel).first().isVisible();
+      if (visible) return sel;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+/**
+ * Get element attribute via page.evaluate — avoids locator.getAttribute() which doesn't exist.
+ */
+async function getAttr(page: any, selector: string, attr: string): Promise<string> {
+  return page.evaluate(
+    ([sel, a]: [string, string]) => {
+      const el = document.querySelector(sel);
+      return el ? (el.getAttribute(a) || "") : "";
+    },
+    [selector, attr] as [string, string]
+  );
+}
+
+/**
+ * Get text content of ALL matching elements via page.evaluate.
+ * Returns array of { text, index } so callers can reference elements by nth index.
+ */
+async function getAllTexts(page: any, selector: string): Promise<Array<{ text: string; index: number }>> {
+  return page.evaluate((sel: string) => {
+    const els = Array.from(document.querySelectorAll(sel));
+    return els.map((el, i) => ({ text: el.textContent || "", index: i }));
+  }, selector);
+}
+
+/**
+ * Scroll element into view using page.evaluate.
+ */
+async function scrollIntoView(page: any, selector: string) {
+  await page.evaluate((sel: string) => {
+    const el = document.querySelector(sel);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, selector);
+}
+
+/**
+ * Click nth matching element via page.evaluate (bypasses all locator chain issues).
+ */
+async function clickNth(page: any, selector: string, n: number) {
+  await page.evaluate(([sel, idx]: [string, number]) => {
+    const els = Array.from(document.querySelectorAll(sel));
+    const el = els[idx] as HTMLElement;
+    if (el) el.click();
+    else throw new Error(`Element ${idx} not found for selector "${sel}"`);
+  }, [selector, n] as [string, number]);
+}
+
+/**
+ * Capture debug screenshot + HTML when DEBUG=true.
+ */
 async function captureDebug(page: any, name: string, idx: number) {
   if (!DEBUG) return;
   try {
@@ -158,293 +190,929 @@ async function captureDebug(page: any, name: string, idx: number) {
     const safe = name.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 50);
     await page.screenshot({ path: `${DEBUG_DIR}/step${idx}_${safe}_${ts}.png`, fullPage: true });
     fs.writeFileSync(`${DEBUG_DIR}/step${idx}_${safe}_${ts}.html`, await page.content());
-  } catch (e: any) { console.log(`    ⚠️  Debug capture failed: ${e.message}`); }
-}
-
-async function runStep(sd: StepDef, page: any, ctx: any, idx = 0) {
-  console.log(`  → ${sd.name}`);
-  if (sd.skipIf) { const skip = typeof sd.skipIf === "function" ? await sd.skipIf(page, ctx) : sd.skipIf; if (skip) { console.log("    ⏭️  Skipped"); return { success: true, skipped: true }; } }
-  try { await execAction(page, sd.action, ctx); } catch (e: any) { console.log(`    ❌ Action failed: ${e.message}`); await captureDebug(page, sd.name, idx); return { success: false, error: e.message }; }
-  await page.waitForTimeout(300);
-  const vr = await execValidator(page, sd.validator, ctx);
-  if (!vr.success) { console.log(`    ❌ Validation failed: ${vr.error || "Check failed"}`); await captureDebug(page, sd.name, idx); return { success: false, ...vr }; }
-  if (sd.onSuccess) {
-    if (sd.onSuccess.type === "setContext") ctx[sd.onSuccess.key] = typeof sd.onSuccess.value === "function" ? await sd.onSuccess.value(page, ctx) : sd.onSuccess.value;
-    else if (sd.onSuccess.type === "captureContext") ctx[sd.onSuccess.key] = await sd.onSuccess.fn(page, ctx);
+  } catch (e: any) {
+    console.log(`    ⚠️  Debug capture failed: ${e.message}`);
   }
-  if (vr.context) Object.assign(ctx, vr.context);
-  console.log("    ✅ Done");
-  return { success: true, ...vr };
 }
 
 // =============================================================================
-// BUILD STEPS — uses the INPUTS object passed at runtime
+// STEP SYSTEM
 // =============================================================================
-function buildSteps(I: any): StepDef[] {
+
+interface Step {
+  name: string;
+  skipIf?: (page: any, ctx: any) => boolean | Promise<boolean>;
+  run: (page: any, ctx: any, stagehand: Stagehand) => Promise<void>;
+}
+
+async function runStep(s: Step, page: any, ctx: any, stagehand: Stagehand, idx: number): Promise<boolean> {
+  console.log(`  [${idx}] → ${s.name}`);
+  if (s.skipIf) {
+    const skip = await s.skipIf(page, ctx);
+    if (skip) { console.log("    ⏭️  Skipped"); return true; }
+  }
+  try {
+    await s.run(page, ctx, stagehand);
+    console.log("    ✅ Done");
+    return true;
+  } catch (e: any) {
+    console.log(`    ❌ Failed: ${e.message}`);
+    await captureDebug(page, s.name, idx);
+    return false;
+  }
+}
+
+// =============================================================================
+// BUILD STEPS
+// =============================================================================
+
+function buildSteps(I: any): Step[] {
+  // Shorthand skip helpers
+  const notFound = (c: any) => !c.customerFound;
+  const alreadyFound = (c: any) => !!c.customerFound;
+  const popupOpen = (c: any) => !!c.bookingPopupOpen;
+  const foundOrPopup = (c: any) => !c.customerFound || c.bookingPopupOpen;
+  const addressFoundOrPopup = (c: any) => !c.customerFound || !!c.addressFound || c.bookingPopupOpen;
+  const newAddrAdded = (c: any) => !c.customerFound || !c.newAddressAdded || c.bookingPopupOpen;
+
   return [
+    // =========================================================================
     // LOGIN
-    step("Navigate to login page").goto("https://misterquik.sera.tech/admins/login").expectVisible('input[type="email"], input[name="email"]').build(),
-    step("Fill email").fill('input[type="email"], input[name="email"]', I.stratablueEmail).build(),
-    step("Fill password").fill('input[type="password"]', I.stratabluePassword).build(),
-    step("Wait before login click").wait(1000).build(),
-    step("Click login button").custom(async (page: any) => {
-      // Try multiple selectors — Sera's button may not have type="submit"
-      const selectors = [
-        'button:has-text("Sign In")',
-        'button:has-text("Login")',
-        'button:has-text("Log In")',
-        'input[type="submit"]',
-        'button[type="submit"]',
-        '.btn-primary',
-        'button.btn',
-      ];
-      for (const sel of selectors) {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await btn.click();
-          console.log(`    ℹ️  Clicked login button with selector: "${sel}"`);
+    // =========================================================================
+    {
+      name: "Navigate to login page",
+      async run(page) {
+        await page.goto("https://misterquik.sera.tech/admins/login", { waitUntil: "domcontentloaded", timeout: 30000 });
+        await waitUntilVisible(page, 'input[type="email"], input[name="email"]', 15000);
+      },
+    },
+    {
+      name: "Fill email",
+      async run(page) {
+        const sel = await firstVisible(page, ['input[type="email"]', 'input[name="email"]']);
+        if (!sel) throw new Error("Email input not found");
+        await page.locator(sel).first().fill(I.stratablueEmail);
+      },
+    },
+    {
+      name: "Fill password",
+      async run(page) {
+        await page.locator('input[type="password"]').first().fill(I.stratabluePassword);
+      },
+    },
+    {
+      name: "Click login button",
+      async run(page) {
+        await page.waitForTimeout(1000);
+        const candidates = [
+          'button:has-text("Sign In")',
+          'button:has-text("Login")',
+          'button:has-text("Log In")',
+          'input[type="submit"]',
+          'button[type="submit"]',
+          ".btn-primary",
+          "button.btn",
+        ];
+        const sel = await firstVisible(page, candidates, 3000);
+        if (!sel) throw new Error("Login button not found");
+        await page.locator(sel).first().click();
+      },
+    },
+    {
+      name: "Wait for post-login redirect",
+      async run(page) {
+        await page.waitForTimeout(5000);
+        for (let i = 0; i < 25; i++) {
+          const url = await page.url();
+          if (!url.includes("/login")) {
+            console.log(`    ℹ️  Redirected to: ${url}`);
+            return;
+          }
+          await page.waitForTimeout(1000);
+        }
+        throw new Error("Still on login page after 30s — check credentials");
+      },
+    },
+
+    // =========================================================================
+    // FIND CUSTOMER — search by address
+    // =========================================================================
+    {
+      name: "Navigate to customers page",
+      async run(page) {
+        await page.goto("https://misterquik.sera.tech/customers", { waitUntil: "domcontentloaded", timeout: 30000 });
+        await waitUntilVisible(page, "table, .customers-list", 15000);
+      },
+    },
+    {
+      name: "Search customers by address",
+      async run(page) {
+        const addrPart = I.serviceAddress.split(",")[0].trim();
+        const sel = await firstVisible(page, [
+          'th.address-field input',
+          'th[class*="address"] input',
+        ], 3000);
+        if (sel) await page.locator(sel).first().fill(addrPart);
+        await page.waitForTimeout(10000);
+      },
+    },
+    {
+      name: "Check customer found by address",
+      async run(page, ctx) {
+        const rows = page.locator("table tbody tr");
+        const count = await rows.count();
+        console.log(`    ℹ️  ${count} rows found`);
+        for (let i = 0; i < count; i++) {
+          const text = await rows.nth(i).textContent();
+          if (
+            (text.includes(I.firstName) && text.includes(I.lastName)) ||
+            text.includes(I.email) ||
+            text.includes(I.phone)
+          ) {
+            console.log(`    ℹ️  Match at row ${i}`);
+            // Extract customer ID from row text (leading digits)
+            const idMatch = text.match(/^(\d+)/);
+            if (idMatch) {
+              await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+            } else {
+              // Fallback: click first link in that row via evaluate
+              await clickNth(page, "table tbody tr a", i);
+            }
+            await page.waitForTimeout(5000);
+            ctx.customerFound = true;
+            return;
+          }
+        }
+        ctx.customerFound = false;
+      },
+    },
+
+    // FALLBACK — search by phone
+    {
+      name: "Clear address search, search by phone",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        const addrSel = await firstVisible(page, ['th.address-field input', 'th[class*="address"] input']);
+        if (addrSel) {
+          await page.locator(addrSel).first().fill("");
+          await page.waitForTimeout(500);
+        }
+        const phoneSel = await firstVisible(page, ['th.phone-field input', 'th[class*="phone"] input']);
+        if (phoneSel) await page.locator(phoneSel).first().fill(I.phone);
+        await page.waitForTimeout(10000);
+      },
+    },
+    {
+      name: "Check customer found by phone",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page, ctx) {
+        const rows = page.locator("table tbody tr");
+        const count = await rows.count();
+        console.log(`    ℹ️  Phone search: ${count} rows`);
+        for (let i = 0; i < count; i++) {
+          const text = await rows.nth(i).textContent();
+          if (
+            (text.includes(I.firstName) && text.includes(I.lastName)) ||
+            text.includes(I.email)
+          ) {
+            const idMatch = text.match(/^(\d+)/);
+            if (idMatch) {
+              await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+            } else {
+              await clickNth(page, "table tbody tr a", i);
+            }
+            await page.waitForTimeout(5000);
+            ctx.customerFound = true;
+            return;
+          }
+        }
+      },
+    },
+
+    // FALLBACK — search by email
+    {
+      name: "Clear phone search, search by email",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        const phoneSel = await firstVisible(page, ['th.phone-field input', 'th[class*="phone"] input']);
+        if (phoneSel) {
+          await page.locator(phoneSel).first().fill("");
+          await page.waitForTimeout(500);
+        }
+        const emailSel = await firstVisible(page, ['th.email-field input', 'th[class*="email"] input']);
+        if (emailSel) await page.locator(emailSel).first().fill(I.email);
+        await page.waitForTimeout(10000);
+      },
+    },
+    {
+      name: "Check customer found by email",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page, ctx) {
+        const rows = page.locator("table tbody tr");
+        const count = await rows.count();
+        console.log(`    ℹ️  Email search: ${count} rows`);
+        for (let i = 0; i < count; i++) {
+          const text = await rows.nth(i).textContent();
+          if (
+            (text.includes(I.firstName) && text.includes(I.lastName)) ||
+            text.includes(I.email)
+          ) {
+            const idMatch = text.match(/^(\d+)/);
+            if (idMatch) {
+              await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+            } else {
+              await clickNth(page, "table tbody tr a", i);
+            }
+            await page.waitForTimeout(5000);
+            ctx.customerFound = true;
+            return;
+          }
+        }
+      },
+    },
+
+    // Verify customer profile loaded
+    {
+      name: "Verify customer profile loaded",
+      skipIf: (_, c) => notFound(c),
+      async run(page) {
+        await page.waitForTimeout(3000);
+        const profileSelectors = [
+          ".customer-show",
+          'h3:has-text("Addresses")',
+          ".addresses-section",
+          ".addresses-cont",
+          ".customer-detail",
+          '[data-cy="address-search"]',
+        ];
+        const found = await firstVisible(page, profileSelectors, 5000);
+        if (found) {
+          console.log(`    ℹ️  Profile confirmed via: "${found}"`);
           return;
         }
-      }
-      throw new Error("Could not find login button with any known selector");
-    }).build(),
-    step("Wait for page to load after login").wait(5000).build(),
-    step("Wait for dashboard").custom(async (page: any) => {
-      // Wait up to 30s for URL to change away from /login
-      for (let i = 0; i < 30; i++) {
-        const url = page.url();
-        if (!url.includes("/login")) {
-          console.log(`    ℹ️  Redirected to: ${url}`);
+        // Check URL as fallback
+        const url = await page.url();
+        if (url.includes("/customers/") && !url.endsWith("/customers")) {
+          console.log(`    ℹ️  Profile URL confirmed: ${url}`);
+          await page.waitForTimeout(2000);
           return;
+        }
+        throw new Error(`Customer profile did not load. URL: ${url}`);
+      },
+    },
+
+    // =========================================================================
+    // CREATE CUSTOMER (only if not found)
+    // =========================================================================
+    {
+      name: "Navigate to new customer page",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.goto("https://misterquik.sera.tech/customers/new", {
+          waitUntil: "domcontentloaded",
+          timeout: 30000,
+        });
+        await waitUntilVisible(page, 'input[data-cy="first-name"], input[name*="first" i]', 10000);
+      },
+    },
+    {
+      name: "Fill first name",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator('input[data-cy="first-name"]').first().fill(I.firstName);
+      },
+    },
+    {
+      name: "Fill last name",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator('input[data-cy="last-name"]').first().fill(I.lastName);
+      },
+    },
+    {
+      name: "Fill customer email",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator('input[data-cy="email-primary"]').first().fill(I.email);
+      },
+    },
+    {
+      name: "Fill customer phone",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator('input[data-cy="phone"]').first().fill(I.phone);
+      },
+    },
+    {
+      name: "Fill service address with autocomplete",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await waitUntilVisible(page, "#address-search-service", 10000);
+        await page.locator("#address-search-service").first().click();
+        await page.locator("#address-search-service").first().fill(I.serviceAddress);
+        await page.waitForTimeout(2000);
+        await waitUntilVisible(page, ".pac-item", 5000);
+        await page.locator(".pac-item").first().click();
+        await page.waitForTimeout(1500);
+      },
+    },
+    {
+      name: "Fill location name",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator('input[data-cy="location-name"]').first().fill(I.locationName);
+      },
+    },
+    {
+      name: "Select location type",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        // Open the dropdown — use flat CSS descendant selector (no chaining)
+        await waitUntilVisible(page, '[data-cy="location-type"] input[data-cy="select-input-field"]', 5000);
+        await page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first().click();
+        await page.waitForTimeout(500);
+        await waitUntilVisible(page, '[data-cy="location-type"] .select-options .option', 3000);
+        // Click matching option via evaluate
+        await page.evaluate((locType: string) => {
+          const options = Array.from(
+            document.querySelectorAll('[data-cy="location-type"] .select-options .option')
+          );
+          const match = options.find(el => el.textContent?.includes(locType)) as HTMLElement;
+          if (match) match.click();
+          else throw new Error(`Location type option "${locType}" not found`);
+        }, I.locationType);
+      },
+    },
+    {
+      name: "Scroll to bottom for tags",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      },
+    },
+    {
+      name: "Add customer tag",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page) {
+        await page.locator("i.tag-menu-btn").first().click();
+        await page.waitForTimeout(1000);
+        await waitUntilVisible(page, 'sera-input input[placeholder="Create or Select Tag"]', 5000);
+        await page.locator('sera-input input[placeholder="Create or Select Tag"]').first().fill(I.customerTag);
+        await page.waitForTimeout(2000);
+        // Click matching tag label via evaluate
+        await page.evaluate((tag: string) => {
+          const labels = Array.from(document.querySelectorAll("span.tag-label"));
+          const match = labels.find(el => el.textContent?.includes(tag)) as HTMLElement;
+          if (match) match.click();
+          else throw new Error(`Tag label "${tag}" not found`);
+        }, I.customerTag);
+        await page.waitForTimeout(500);
+      },
+    },
+    {
+      name: "Click Save & Schedule",
+      skipIf: (_, c) => alreadyFound(c),
+      async run(page, ctx) {
+        await page.locator('button[data-cy="save-customer-continue"]').first().click();
+        await waitUntilHidden(page, ".spinner, .loading", 30000);
+        await page.waitForTimeout(2000);
+        ctx.customerFound = true;
+        ctx.newCustomerCreated = true;
+        ctx.bookingPopupOpen = true;
+      },
+    },
+
+    // =========================================================================
+    // LOCATE ADDRESS on customer profile
+    // =========================================================================
+    {
+      name: "Search for address in customer profile",
+      skipIf: (_, c) => foundOrPopup(c),
+      async run(page) {
+        await page.waitForTimeout(5000);
+        const searchSelectors = [
+          '[data-cy="address-search"] input',
+          'sera-input[data-cy="address-search"] input',
+          'input[placeholder*="Search" i]',
+          'input[placeholder*="Address" i]',
+          ".addresses-cont input",
+        ];
+        const sn = extractStreetNumber(I.serviceAddress);
+        const sa = I.serviceAddress.split(",")[0].trim();
+        const searchTerm = sn || sa;
+        const sel = await firstVisible(page, searchSelectors, 3000);
+        if (sel) {
+          await page.locator(sel).first().fill(searchTerm);
+          console.log(`    ℹ️  Searched for "${searchTerm}" using "${sel}"`);
+        } else {
+          console.log(`    ⚠️  Address search input not found — will scan all cards`);
+        }
+        await page.waitForTimeout(1500);
+      },
+    },
+    {
+      name: "Check if address exists and click Schedule",
+      skipIf: (_, c) => foundOrPopup(c),
+      async run(page, ctx) {
+        const sa = I.serviceAddress.split(",")[0].trim();
+        const count = await page.locator(".address-card").count();
+        console.log(`    ℹ️  ${count} address card(s)`);
+
+        if (count === 0) { ctx.addressFound = false; return; }
+
+        // Get all card texts via evaluate
+        const cardTexts: string[] = await page.evaluate(() =>
+          Array.from(document.querySelectorAll(".address-card")).map(el => el.textContent || "")
+        );
+
+        let matchedIndex = -1;
+        for (let i = 0; i < cardTexts.length; i++) {
+          if (addressesMatch(cardTexts[i], sa)) {
+            matchedIndex = i;
+            console.log(`    ℹ️  Address matched at card ${i}`);
+            break;
+          }
+        }
+
+        if (matchedIndex === -1) {
+          console.log(`    ℹ️  No address card matched "${sa}"`);
+          ctx.addressFound = false;
+          return;
+        }
+
+        ctx.addressFound = true;
+
+        // Click the Schedule button inside the matched card via evaluate
+        const clicked = await page.evaluate((idx: number) => {
+          const cards = Array.from(document.querySelectorAll(".address-card"));
+          const card = cards[idx];
+          if (!card) return false;
+          // Try data-cy first, then any button/link with "Schedule" text
+          const schedBtn =
+            card.querySelector('[data-cy="address-schedule-link"]') ||
+            Array.from(card.querySelectorAll("button, a")).find(el =>
+              el.textContent?.toLowerCase().includes("schedule")
+            );
+          if (schedBtn) { (schedBtn as HTMLElement).click(); return true; }
+          return false;
+        }, matchedIndex);
+
+        if (!clicked) throw new Error(`Schedule button not found in card ${matchedIndex}`);
+        await page.waitForTimeout(2000);
+      },
+    },
+
+    // =========================================================================
+    // ADD NEW ADDRESS (if not found)
+    // =========================================================================
+    {
+      name: "Open Address Actions dropdown",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page) {
+        // Clear search input
+        const si = await firstVisible(page, ['sera-input[data-cy="address-search"] input'], 2000);
+        if (si) {
+          await page.locator(si).first().fill("");
+          await page.waitForTimeout(500);
+        }
+        await page.locator('sera-button[data-cy="address-actions-trigger"]').first().click();
+        await page.waitForTimeout(500);
+      },
+    },
+    {
+      name: "Click Add Address option",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page) {
+        // Use evaluate to find "Add Address" text anywhere
+        const clicked = await page.evaluate(() => {
+          const all = Array.from(document.querySelectorAll("*"));
+          const el = all.find(
+            e => e.textContent?.trim().toLowerCase() === "add address" && (e as HTMLElement).offsetParent !== null
+          ) as HTMLElement;
+          if (el) { el.click(); return true; }
+          return false;
+        });
+        if (!clicked) throw new Error('"Add Address" option not found');
+        await page.waitForTimeout(1000);
+      },
+    },
+    {
+      name: "Fill new address with autocomplete",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page, ctx) {
+        await waitUntilVisible(page, '.modal, [role="dialog"]', 10000);
+        // Find first text input inside the modal
+        const modalInputSel = '.modal input[type="text"], [role="dialog"] input[type="text"]';
+        await waitUntilVisible(page, modalInputSel, 5000);
+        await page.locator(modalInputSel).first().click();
+        await page.locator(modalInputSel).first().fill(I.serviceAddress);
+        await page.waitForTimeout(2000);
+        const pacVisible = await page.locator(".pac-item").first().isVisible();
+        if (pacVisible) {
+          await page.locator(".pac-item").first().click();
+          await page.waitForTimeout(1500);
+          ctx.actualStreetAddress = await page.locator(modalInputSel).first().inputValue();
+        }
+      },
+    },
+    {
+      name: "Fill location name for new address",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page) {
+        const liVisible = await page.locator('input[data-cy="location-name"]').first().isVisible();
+        if (liVisible) await page.locator('input[data-cy="location-name"]').first().fill(I.locationName);
+      },
+    },
+    {
+      name: "Select location type for new address",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page) {
+        const ddSel = '[data-cy="location-type"] input[data-cy="select-input-field"]';
+        const ddVisible = await page.locator(ddSel).first().isVisible();
+        if (!ddVisible) return;
+        await page.locator(ddSel).first().click();
+        await page.waitForTimeout(500);
+        await page.evaluate((locType: string) => {
+          const options = Array.from(
+            document.querySelectorAll('[data-cy="location-type"] .select-options .option')
+          );
+          const match = options.find(el => el.textContent?.includes(locType)) as HTMLElement;
+          if (match) match.click();
+        }, I.locationType);
+      },
+    },
+    {
+      name: "Save new address",
+      skipIf: (_, c) => addressFoundOrPopup(c),
+      async run(page, ctx) {
+        const modalSaveSel = '.modal button:has-text("Save"), [role="dialog"] button:has-text("Save"), .modal sera-button:has-text("Save"), [role="dialog"] sera-button:has-text("Save")';
+        // Use evaluate for robustness
+        const saved = await page.evaluate(() => {
+          const modal = document.querySelector('.modal, [role="dialog"]');
+          if (!modal) return false;
+          const btn = Array.from(modal.querySelectorAll("button, sera-button")).find(
+            el => el.textContent?.toLowerCase().includes("save")
+          ) as HTMLElement;
+          if (btn) { btn.click(); return true; }
+          return false;
+        });
+        if (!saved) {
+          // Fallback: try with locator
+          await page.locator(modalSaveSel).first().click();
+        }
+        await page.waitForTimeout(2000);
+        ctx.addressFound = true;
+        ctx.newAddressAdded = true;
+      },
+    },
+    {
+      name: "Find newly added address and click Schedule",
+      skipIf: (_, c) => newAddrAdded(c),
+      async run(page, ctx) {
+        await waitUntilVisible(page, ".addresses-cont", 10000);
+        await page.waitForTimeout(1000);
+
+        const raw = ((ctx.actualStreetAddress || I.serviceAddress) as string).split(",")[0].trim();
+        const sn = extractStreetNumber(raw);
+
+        // Fill search
+        const siSel = 'sera-input[data-cy="address-search"] input';
+        const siVisible = await page.locator(siSel).first().isVisible();
+        if (siVisible) {
+          await page.locator(siSel).first().fill(sn || raw);
+          await page.waitForTimeout(1500);
+        }
+
+        const cardTexts: string[] = await page.evaluate(() =>
+          Array.from(document.querySelectorAll(".address-card")).map(el => el.textContent || "")
+        );
+
+        let matchedIndex = cardTexts.findIndex(t => addressesMatch(t, raw));
+        if (matchedIndex === -1 && cardTexts.length === 1 && sn && cardTexts[0].includes(sn)) {
+          matchedIndex = 0;
+        }
+        if (matchedIndex === -1) throw new Error(`Could not find address "${raw}" in cards`);
+
+        const clicked = await page.evaluate((idx: number) => {
+          const cards = Array.from(document.querySelectorAll(".address-card"));
+          const card = cards[idx];
+          if (!card) return false;
+          const schedBtn =
+            card.querySelector('[data-cy="address-schedule-link"]') ||
+            Array.from(card.querySelectorAll("button, a")).find(el =>
+              el.textContent?.toLowerCase().includes("schedule")
+            );
+          if (schedBtn) { (schedBtn as HTMLElement).click(); return true; }
+          return false;
+        }, matchedIndex);
+
+        if (!clicked) throw new Error(`Schedule button not in card ${matchedIndex}`);
+        await page.waitForTimeout(2000);
+
+        // Verify modal opened
+        await waitUntilVisible(page, '.modal, [role="dialog"], .booking-popup, .modal-content', 8000);
+        ctx.bookingPopupOpen = true;
+      },
+    },
+
+    // Wait for booking modal (for existing address path)
+    {
+      name: "Wait for booking modal",
+      skipIf: (_, c) => !c.addressFound || !!c.newAddressAdded || !!c.bookingPopupOpen,
+      async run(page, ctx) {
+        await waitUntilVisible(page, '.modal, [role="dialog"], .booking-popup, .modal-content', 15000);
+        ctx.bookingPopupOpen = true;
+      },
+    },
+
+    // =========================================================================
+    // SERVICE CATEGORY
+    // =========================================================================
+    {
+      name: "Wait for service category select",
+      async run(page) {
+        await waitUntilVisible(page, '[data-cy="service-category-select"]', 15000);
+      },
+    },
+    {
+      name: "Open service category dropdown",
+      async run(page) {
+        // Flat descendant selector — no chaining
+        const inputSel = '[data-cy="service-category-select"] input[data-cy="select-input-field"], [data-cy="service-category-select"] .ss-input-field, [data-cy="service-category-select"] input';
+        await waitUntilVisible(page, inputSel, 10000);
+        await page.locator(inputSel).first().click();
+        await page.waitForTimeout(500);
+        await page.locator(inputSel).first().fill(I.serviceCategory);
+        await page.waitForTimeout(1500);
+      },
+    },
+    {
+      name: "Select service category option",
+      async run(page) {
+        const optionSel = '.ss-option, [role="option"], [class*="option"]';
+        // Try exact text match via evaluate
+        const clicked = await page.evaluate((cat: string) => {
+          const options = Array.from(document.querySelectorAll('.ss-option, [role="option"], [class*="option"]'));
+          const exact = options.find(el => el.textContent?.trim() === cat) as HTMLElement;
+          if (exact) { exact.click(); return true; }
+          const partial = options.find(el => el.textContent?.includes(cat)) as HTMLElement;
+          if (partial) { partial.click(); return true; }
+          return false;
+        }, I.serviceCategory);
+
+        if (!clicked) {
+          // Fallback: keyboard nav
+          const inputSel = '[data-cy="service-category-select"] input[data-cy="select-input-field"], [data-cy="service-category-select"] input';
+          await page.locator(inputSel).first().press("ArrowDown");
+          await page.waitForTimeout(300);
+          await page.locator(inputSel).first().press("Enter");
         }
         await page.waitForTimeout(1000);
-      }
-      throw new Error("Still on login page after 30 seconds — login may have failed. Check credentials.");
-    }).build(),
+      },
+    },
+    {
+      name: "Wait for calendar to appear",
+      async run(page) {
+        await waitUntilVisible(page, "table td, .calendar-day, .fc-daygrid", 15000);
+      },
+    },
 
-    // FIND CUSTOMER
-    step("Navigate to customers page").goto("https://misterquik.sera.tech/customers").expectVisible("table, .customers-list").build(),
-    step("Search by address").fill('th.address-field input, th[class*="address"] input', I.serviceAddress.split(",")[0].trim()).build(),
-    step("Wait for search results").wait(10000).build(),
-    step("Check if customer found by address").custom(async (page: any, ctx: any) => {
-      const rows = page.locator("table tbody tr"); const count = await rows.count();
-      for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
-        if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email) || t.includes(I.phone)) { await row.locator("a").first().click(); ctx.customerFound = true; return; }
-      } ctx.customerFound = false;
-    }).expect(async () => ({ success: true })).build(),
+    // =========================================================================
+    // SELECT DATE (AI agent)
+    // =========================================================================
+    {
+      name: "Select date on calendar",
+      async run(_page, _ctx, stagehand) {
+        const agent = stagehand.agent({
+          mode: "cua",
+          model: "google/gemini-2.5-computer-use-preview-10-2025",
+        });
+        await agent.execute(
+          `Look at the calendar in the booking modal. ` +
+          `Target Date: ${I.appointmentDate} (${I.appointmentDateMonth}, day ${I.appointmentDateDay}). ` +
+          `Scroll down to see the calendar, navigate to ${I.appointmentDateMonth} if needed, ` +
+          `then click ONLY day "${I.appointmentDateDay}". ` +
+          `Do NOT select any other date. STOP when time slots appear.`
+        );
+      },
+    },
+    {
+      name: "Verify date selected and wait for time slots",
+      async run(page, ctx) {
+        // Scroll modal back to top
+        await page.evaluate(() => {
+          const m = document.querySelector('.modal-content, [role="dialog"]');
+          if (m) (m as any).scrollTop = 0;
+          window.scrollTo(0, 0);
+        });
+        await page.waitForTimeout(500);
+        ctx.selectedDate = I.appointmentDateDay;
 
-    // Fallback: phone
-    step("Clear address and search by phone").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const ai = page.locator('th.address-field input, th[class*="address"] input').first();
-      if (await ai.isVisible({ timeout: 2000 }).catch(() => false)) { await ai.clear(); await page.waitForTimeout(500); }
-      const pi = page.locator('th.phone-field input, th[class*="phone"] input').first();
-      if (await pi.isVisible({ timeout: 2000 }).catch(() => false)) await pi.fill(I.phone);
-    }).build(),
-    step("Wait for phone search results").skipIf((_p: any, c: any) => c.customerFound).wait(10000).build(),
-    step("Check if customer found by phone").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
-      const rows = page.locator("table tbody tr"); const count = await rows.count();
-      for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
-        if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email)) { await row.locator("a").first().click(); ctx.customerFound = true; return; }
-      }
-    }).expect(async () => ({ success: true })).build(),
+        // Wait for time slots
+        for (const sel of ['[data-cy^="time-slot-"]', ".slot-button"]) {
+          try {
+            await waitUntilVisible(page, sel, 15000);
+            return;
+          } catch { /* try next */ }
+        }
+        throw new Error("Time slots never appeared after date selection");
+      },
+    },
 
-    // Fallback: email
-    step("Clear phone and search by email").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const pi = page.locator('th.phone-field input, th[class*="phone"] input').first();
-      if (await pi.isVisible({ timeout: 2000 }).catch(() => false)) { await pi.clear(); await page.waitForTimeout(500); }
-      const ei = page.locator('th.email-field input, th[class*="email"] input').first();
-      if (await ei.isVisible({ timeout: 2000 }).catch(() => false)) await ei.fill(I.email);
-    }).build(),
-    step("Wait for email search results").skipIf((_p: any, c: any) => c.customerFound).wait(10000).build(),
-    step("Check if customer found by email").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
-      const rows = page.locator("table tbody tr"); const count = await rows.count();
-      for (let i = 0; i < count; i++) { const row = rows.nth(i); const t = await row.textContent();
-        if ((t.includes(I.firstName) && t.includes(I.lastName)) || t.includes(I.email)) { await row.locator("a").first().click(); ctx.customerFound = true; return; }
-      }
-    }).expect(async () => ({ success: true })).build(),
-    step("Wait for customer profile (if found)").skipIf((_p: any, c: any) => !c.customerFound).waitFor('.customer-show, h3:has-text("Addresses"), .addresses-section', "visible").build(),
-
-    // CREATE CUSTOMER
-    step("Navigate to new customer page").skipIf((_p: any, c: any) => c.customerFound).goto("https://misterquik.sera.tech/customers/new").expectVisible('input[name*="first" i], input[placeholder*="First Name" i]').build(),
-    step("Fill first name").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="first-name"]', I.firstName).build(),
-    step("Fill last name").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="last-name"]', I.lastName).build(),
-    step("Fill customer email").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="email-primary"]', I.email).build(),
-    step("Fill customer phone").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="phone"]', I.phone).build(),
-    step("Fill service address with autocomplete").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const ai = page.locator("#address-search-service").first(); await ai.waitFor({ state: "visible", timeout: 10000 }); await ai.click(); await ai.fill(I.serviceAddress); await page.waitForTimeout(2000);
-      const fs = page.locator(".pac-item").first(); await fs.waitFor({ state: "visible", timeout: 5000 }); await fs.click();
-    }).build(),
-    step("Wait for address selection").skipIf((_p: any, c: any) => c.customerFound).wait(1500).build(),
-    step("Fill location name").skipIf((_p: any, c: any) => c.customerFound).fill('input[data-cy="location-name"]', I.locationName).build(),
-    step("Select location type").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      const dd = page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first(); await dd.waitFor({ state: "visible", timeout: 5000 }); await dd.click(); await page.waitForTimeout(500);
-      const opt = page.locator('[data-cy="location-type"] .select-options .option').filter({ hasText: I.locationType }).first(); await opt.waitFor({ state: "visible", timeout: 3000 }); await opt.click();
-    }).build(),
-    step("Scroll to bottom for tags").skipIf((_p: any, c: any) => c.customerFound).scroll("bottom").build(),
-    step("Add customer tag").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any) => {
-      await page.locator("i.tag-menu-btn").first().click(); await page.waitForTimeout(1000);
-      const ti = page.locator('sera-input input[placeholder="Create or Select Tag"]').first(); await ti.waitFor({ state: "visible", timeout: 5000 }); await ti.fill(I.customerTag); await page.waitForTimeout(2000);
-      await page.locator("span.tag-label").filter({ hasText: I.customerTag }).first().click(); await page.waitForTimeout(500);
-    }).build(),
-    step("Click Save & Schedule button").skipIf((_p: any, c: any) => c.customerFound).custom(async (page: any, ctx: any) => {
-      await page.locator('button[data-cy="save-customer-continue"]').first().click();
-      try { await page.locator(".spinner, .loading, text=Loading").waitFor({ state: "hidden", timeout: 30000 }); } catch {}
-      await page.waitForTimeout(2000); ctx.customerFound = true; ctx.newCustomerCreated = true; ctx.bookingPopupOpen = true;
-    }).build(),
-
-    // LOCATE ADDRESS
-    step("Search for address in customer profile").skipIf((_p: any, c: any) => !c.customerFound || c.bookingPopupOpen).custom(async (page: any) => {
-      await page.locator(".addresses-cont").waitFor({ state: "visible", timeout: 10000 });
-      const sn = extractStreetNumber(I.serviceAddress); const sa = I.serviceAddress.split(",")[0].trim();
-      const si = page.locator('sera-input[data-cy="address-search"] input').first(); await si.waitFor({ state: "visible", timeout: 5000 }); await si.fill(sn || sa); await page.waitForTimeout(1500);
-    }).build(),
-    step("Check if address exists and click Schedule").skipIf((_p: any, c: any) => !c.customerFound || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      const sa = I.serviceAddress.split(",")[0].trim(); const cards = page.locator(".address-card"); const count = await cards.count();
-      if (count === 0) { ctx.addressFound = false; return; }
-      let found: any = null;
-      for (let i = 0; i < count; i++) { const card = cards.nth(i); const t = await card.textContent(); if (addressesMatch(t, sa)) { found = card; break; } }
-      if (!found) { ctx.addressFound = false; return; }
-      ctx.addressFound = true; await found.locator('sera-button[data-cy="address-schedule-link"]').first().click();
-    }).expect(async () => ({ success: true })).build(),
-
-    // ADD NEW ADDRESS (abbreviated — same logic as full version)
-    step("Open Address Actions dropdown").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any) => {
-      const si = page.locator('sera-input[data-cy="address-search"] input').first();
-      if (await si.isVisible({ timeout: 2000 }).catch(() => false)) { await si.clear(); await page.waitForTimeout(500); }
-      await page.locator('sera-button[data-cy="address-actions-trigger"]').first().click(); await page.waitForTimeout(500);
-    }).build(),
-    step("Click Add Address option").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any) => {
-      await page.getByText("Add Address", { exact: false }).first().click(); await page.waitForTimeout(1000);
-    }).build(),
-    step("Fill new address with autocomplete").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      const modal = page.locator('.modal, [role="dialog"]').filter({ hasText: "New Address" }).first(); await modal.waitFor({ state: "visible", timeout: 10000 });
-      const ai = modal.locator('input[type="text"]').first(); await ai.click(); await ai.fill(I.serviceAddress); await page.waitForTimeout(2000);
-      const fs = page.locator(".pac-item").first();
-      if (await fs.isVisible({ timeout: 3000 }).catch(() => false)) { await fs.click(); await page.waitForTimeout(1500); ctx.actualStreetAddress = await ai.inputValue(); }
-    }).build(),
-    step("Fill location name for new address").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any) => {
-      const li = page.locator('input[data-cy="location-name"]').first();
-      if (await li.isVisible({ timeout: 3000 }).catch(() => false)) await li.fill(I.locationName);
-    }).build(),
-    step("Select location type for new address").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any) => {
-      const dd = page.locator('[data-cy="location-type"] input[data-cy="select-input-field"]').first();
-      if (await dd.isVisible({ timeout: 3000 }).catch(() => false)) { await dd.click(); await page.waitForTimeout(500);
-        const opt = page.locator('[data-cy="location-type"] .select-options .option').filter({ hasText: I.locationType }).first();
-        if (await opt.isVisible({ timeout: 3000 }).catch(() => false)) await opt.click();
-      }
-    }).build(),
-    step("Save new address").skipIf((_p: any, c: any) => !c.customerFound || c.addressFound || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      const modal = page.locator('.modal, [role="dialog"]').filter({ hasText: "New Address" }).first();
-      await modal.locator('button:has-text("Save"), sera-button:has-text("Save")').first().click(); await page.waitForTimeout(2000);
-      ctx.addressFound = true; ctx.newAddressAdded = true;
-    }).build(),
-    step("Find newly added address and click Schedule").skipIf((_p: any, c: any) => !c.customerFound || !c.newAddressAdded || c.bookingPopupOpen).custom(async (page: any, ctx: any) => {
-      await page.locator(".addresses-cont").waitFor({ state: "visible", timeout: 10000 }); await page.waitForTimeout(1000);
-      const raw = (ctx.actualStreetAddress || I.serviceAddress).split(",")[0].trim(); const sn = extractStreetNumber(raw);
-      const si = page.locator('sera-input[data-cy="address-search"] input').first();
-      if (await si.isVisible({ timeout: 2000 }).catch(() => false)) { await si.fill(sn || raw); await page.waitForTimeout(1500); }
-      const cards = page.locator(".address-card"); const count = await cards.count();
-      let found: any = null;
-      for (let i = 0; i < count; i++) { const card = cards.nth(i); const t = await card.textContent(); if (addressesMatch(t, raw)) { found = card; break; } }
-      if (!found && count === 1 && sn) { const t = await cards.first().textContent(); if (t.includes(sn)) found = cards.first(); }
-      if (!found) throw new Error(`Failed to find address "${raw}"`);
-      await found.locator('sera-button[data-cy="address-schedule-link"]').first().click();
-    }).expectVisible('.modal, [role="dialog"], .booking-popup, .modal-content').setContext("bookingPopupOpen", true).build(),
-
-    step("Wait for booking modal").skipIf((_p: any, c: any) => !c.addressFound || c.newAddressAdded || c.bookingPopupOpen).waitFor('.modal, [role="dialog"], .booking-popup, .modal-content', "visible").setContext("bookingPopupOpen", true).build(),
-
-    // SERVICE CATEGORY
-    step("Wait for service category select").waitFor('[data-cy="service-category-select"]', "visible").build(),
-    step("Click service category input").custom(async (page: any) => {
-      const sc = page.locator('[data-cy="service-category-select"]').first(); await sc.waitFor({ state: "visible", timeout: 10000 });
-      await sc.locator('[data-cy="select-input-field"], .ss-input-field, input').first().click();
-    }).build(),
-    step("Wait for dropdown").wait(500).build(),
-    step("Type service category").custom(async (page: any) => {
-      await page.locator('[data-cy="service-category-select"]').first().locator('[data-cy="select-input-field"], .ss-input-field, input').first().fill(I.serviceCategory);
-    }).build(),
-    step("Wait for filter").wait(1500).build(),
-    step("Select service category option").custom(async (page: any) => {
-      const opt = page.locator('.ss-option, [role="option"], [class*="option"]').filter({ hasText: new RegExp(`^${I.serviceCategory}$`) }).first();
-      if (await opt.isVisible({ timeout: 3000 }).catch(() => false)) await opt.click();
-      else { const si = page.locator('[data-cy="service-category-select"] [data-cy="select-input-field"]').first(); await si.press("ArrowDown"); await page.waitForTimeout(300); await si.press("Enter"); }
-    }).build(),
-    step("Wait for selection").wait(1000).build(),
-    step("Wait for calendar").waitFor("table td, .calendar-day, .fc-daygrid", "visible").build(),
-
-    // SELECT DATE (AI)
-    step("Select date on calendar").ai(`Look at the calendar in the booking modal. Target Date: ${I.appointmentDate} (${I.appointmentDateMonth}, day ${I.appointmentDateDay}). Scroll down to see the calendar, navigate to ${I.appointmentDateMonth} if needed, then click ONLY day "${I.appointmentDateDay}". Do NOT select any other date. STOP when time slots appear.`).build(),
-
-    step("Verify date and wait for time slots").custom(async (page: any, ctx: any) => {
-      await page.evaluate(() => { const m = document.querySelector('.modal-content, [role="dialog"]'); if (m) (m as any).scrollTop = 0; window.scrollTo(0, 0); }); await page.waitForTimeout(500);
-      ctx.selectedDate = I.appointmentDateDay;
-      for (const sel of ['[data-cy^="time-slot-"]', ".slot-button"]) {
-        try { await page.locator(sel).first().waitFor({ state: "visible", timeout: 15000 }); return; } catch {}
-      }
-      throw new Error("Time slots never appeared after selecting date.");
-    }).expect(async (_p: any, c: any) => ({ success: !!c.selectedDate })).build(),
-
+    // =========================================================================
     // SELECT TIME SLOT
-    step("Select time slot").custom(async (page: any, ctx: any) => {
-      await page.waitForTimeout(1000);
-      const allSlots = page.locator('[data-cy^="time-slot-"]'); const sc = await allSlots.count();
-      if (sc === 0) throw new Error("No time slot buttons found");
-      const slots: any[] = [];
-      for (let i = 0; i < sc; i++) { const s = allSlots.nth(i); const cl = (await s.getAttribute("class")) || ""; const dc = (await s.getAttribute("data-cy")) || ""; const lb = (await s.textContent()).trim();
-        slots.push({ index: i, label: lb, labelHour: parseRequestedTimeToHour(lb), dataCyHour: extractHourFromDataCy(dc), isClickable: !cl.split(/\s+/).includes("disabled") }); }
-      const clickable = slots.filter(s => s.isClickable);
-      if (clickable.length === 0) throw new Error("No clickable time slots available.");
-      const rh = parseRequestedTimeToHour(I.appointmentTime);
-      let target = clickable.find(s => { const n = (t: string) => t.toLowerCase().replace(/\s+/g, " ").trim(); return n(s.label) === n(I.appointmentTime); });
-      if (!target && rh !== null) target = clickable.find(s => s.labelHour === rh);
-      if (!target) { if (rh !== null) { target = [...clickable].sort((a, b) => Math.abs((a.labelHour ?? 99) - rh) - Math.abs((b.labelHour ?? 99) - rh))[0]; } else target = clickable[0]; ctx.timeSlotDiffers = true; }
-      else ctx.timeSlotDiffers = false;
-      await allSlots.nth(target.index).scrollIntoViewIfNeeded(); await page.waitForTimeout(300); await allSlots.nth(target.index).click();
-      ctx.selectedTimeSlot = target.label;
-    }).build(),
-    step("Verify time slot").custom(async (page: any, ctx: any) => {
-      const sel = page.locator('[data-cy^="time-slot-"].selected, .slot-button.selected').first();
-      if (!(await sel.isVisible({ timeout: 5000 }).catch(() => false))) {
-        await page.locator('[data-cy^="time-slot-"]:not(.disabled)').first().click(); await page.waitForTimeout(500);
-        ctx.selectedTimeSlot = (await page.locator('[data-cy^="time-slot-"].selected').first().textContent()).trim(); ctx.timeSlotDiffers = true;
-      }
-    }).expect(async (_p: any, c: any) => ({ success: !!c.selectedTimeSlot })).build(),
+    // =========================================================================
+    {
+      name: "Select time slot",
+      async run(page, ctx) {
+        await page.waitForTimeout(1000);
 
+        // Gather slot data via evaluate (getAttribute not available on locators)
+        const slotData: Array<{ index: number; label: string; dataCy: string; classes: string }> =
+          await page.evaluate(() =>
+            Array.from(document.querySelectorAll('[data-cy^="time-slot-"]')).map((el, i) => ({
+              index: i,
+              label: el.textContent?.trim() || "",
+              dataCy: el.getAttribute("data-cy") || "",
+              classes: el.getAttribute("class") || "",
+            }))
+          );
+
+        if (slotData.length === 0) throw new Error("No time slot elements found");
+
+        const slots = slotData.map(s => ({
+          ...s,
+          labelHour: parseRequestedTimeToHour(s.label),
+          dataCyHour: extractHourFromDataCy(s.dataCy),
+          isClickable: !s.classes.split(/\s+/).includes("disabled"),
+        }));
+
+        const clickable = slots.filter(s => s.isClickable);
+        if (clickable.length === 0) throw new Error("No clickable time slots available");
+
+        const rh = parseRequestedTimeToHour(I.appointmentTime);
+        const norm = (t: string) => t.toLowerCase().replace(/\s+/g, " ").trim();
+
+        let target =
+          clickable.find(s => norm(s.label) === norm(I.appointmentTime)) ||
+          (rh !== null ? clickable.find(s => s.labelHour === rh) : undefined);
+
+        if (!target) {
+          if (rh !== null) {
+            target = [...clickable].sort(
+              (a, b) => Math.abs((a.labelHour ?? 99) - rh) - Math.abs((b.labelHour ?? 99) - rh)
+            )[0];
+          } else {
+            target = clickable[0];
+          }
+          ctx.timeSlotDiffers = true;
+        } else {
+          ctx.timeSlotDiffers = false;
+        }
+
+        // Scroll into view then click via evaluate
+        await page.evaluate((idx: number) => {
+          const slots = Array.from(document.querySelectorAll('[data-cy^="time-slot-"]'));
+          const el = slots[idx] as HTMLElement;
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            el.click();
+          }
+        }, target.index);
+
+        ctx.selectedTimeSlot = target.label;
+        await page.waitForTimeout(500);
+      },
+    },
+    {
+      name: "Verify time slot selected",
+      async run(page, ctx) {
+        const selectedVisible = await page.locator('[data-cy^="time-slot-"].selected, .slot-button.selected').first().isVisible();
+        if (!selectedVisible) {
+          // Click first available slot as fallback
+          await page.locator('[data-cy^="time-slot-"]:not(.disabled)').first().click();
+          await page.waitForTimeout(500);
+          const label = await page.locator('[data-cy^="time-slot-"].selected, .slot-button.selected').first().textContent();
+          ctx.selectedTimeSlot = label?.trim() || I.appointmentTime;
+          ctx.timeSlotDiffers = true;
+        }
+        if (!ctx.selectedTimeSlot) throw new Error("Could not confirm time slot selection");
+      },
+    },
+
+    // =========================================================================
     // NOTES & SAVE
-    step("Fill appointment notes").custom(async (page: any, ctx: any) => {
-      const time = ctx.selectedTimeSlot || I.appointmentTime;
-      const notes = `Booked By Stratablue AI\n\nMr Quik Inbound Agent | Existing Customer\nCreated At: ${I.createdAt}\nFirst Name: ${I.firstName}\nLast Name: ${I.lastName}\nPhone Number: ${I.phone}\nEmail: ${I.email}\nService Category: ${I.serviceCategory}\nJob Details Address: ${I.serviceAddress}\nAppointment Date: ${I.appointmentDate}\nAppointment Time: ${time}\nJob Summary: ${I.jobSummary}\nPriority Level: ${I.priorityLevel}\nAge of Home: ${I.ageOfHome}\nAge of Equipment: ${I.ageOfEquipment}\nMessage for Team: ${I.messageForTeam}\nCall Outcome: ${I.callOutcome}\nCall ID: ${I.callId}`;
-      const ta = page.locator('textarea[name*="notes" i], textarea[placeholder*="Notes" i], textarea').first();
-      if (await ta.isVisible({ timeout: 3000 }).catch(() => false)) await ta.fill(notes);
-    }).build(),
-    step("Click Save button (modal)").skipIf((_p: any, c: any) => c.newCustomerCreated).click('[data-cy="modal-submit-btn"], button:has-text("Save"), button[type="submit"]').build(),
-    step("Click Save button (non-modal)").skipIf((_p: any, c: any) => !c.newCustomerCreated).click('[data-cy="save-job"], button:has-text("Schedule Appointment")').build(),
-    step("Wait for confirmation").wait(3000).build(),
-    step("Verify booking saved (modal)").skipIf((_p: any, c: any) => c.newCustomerCreated).custom(async (page: any, ctx: any) => {
-      await page.waitForTimeout(1000);
-      if (await page.locator('.modal-content, [role="dialog"]').first().isVisible().catch(() => false)) {
-        const err = await page.locator('.error, .validation-error, [class*="error"]').first().textContent({ timeout: 1000 }).catch(() => null);
-        if (err) throw new Error(`Booking failed: ${err}`); throw new Error("Modal still visible");
-      } ctx.bookingSaved = true;
-    }).expect(async (_p: any, c: any) => ({ success: c.bookingSaved === true })).build(),
-    step("Verify booking saved (non-modal)").skipIf((_p: any, c: any) => !c.newCustomerCreated).custom(async (page: any, ctx: any) => {
-      await page.waitForTimeout(2000); ctx.bookingSaved = true;
-    }).expect(async (_p: any, c: any) => ({ success: c.bookingSaved === true })).build(),
+    // =========================================================================
+    {
+      name: "Fill appointment notes",
+      async run(page, ctx) {
+        const time = ctx.selectedTimeSlot || I.appointmentTime;
+        const notes = [
+          "Booked By Stratablue AI",
+          "",
+          "Mr Quik Inbound Agent | Existing Customer",
+          `Created At: ${I.createdAt}`,
+          `First Name: ${I.firstName}`,
+          `Last Name: ${I.lastName}`,
+          `Phone Number: ${I.phone}`,
+          `Email: ${I.email}`,
+          `Service Category: ${I.serviceCategory}`,
+          `Job Details Address: ${I.serviceAddress}`,
+          `Appointment Date: ${I.appointmentDate}`,
+          `Appointment Time: ${time}`,
+          `Job Summary: ${I.jobSummary}`,
+          `Priority Level: ${I.priorityLevel}`,
+          `Age of Home: ${I.ageOfHome}`,
+          `Age of Equipment: ${I.ageOfEquipment}`,
+          `Message for Team: ${I.messageForTeam}`,
+          `Call Outcome: ${I.callOutcome}`,
+          `Call ID: ${I.callId}`,
+        ].join("\n");
 
-    // DONE
-    step("Generate completion report").custom(async (_page: any, ctx: any) => {
-      const time = ctx.selectedTimeSlot || I.appointmentTime;
-      let msg = `Booking successful for ${I.firstName} ${I.lastName} at ${I.serviceAddress} on ${I.appointmentDate} at ${time}.`;
-      if (ctx.newAddressAdded) msg += `\nNote: New address was added to customer profile.`;
-      if (ctx.timeSlotDiffers) msg += `\nNote: Requested ${I.appointmentTime} was unavailable. Booked ${time} instead.`;
-      console.log(`\n🎉 ${msg}`); ctx.completionMessage = msg;
-    }).build(),
+        const taSel = 'textarea[name*="notes" i], textarea[placeholder*="Notes" i], textarea';
+        const taVisible = await page.locator(taSel).first().isVisible();
+        if (taVisible) await page.locator(taSel).first().fill(notes);
+        else console.log(`    ⚠️  Notes textarea not found — skipping`);
+      },
+    },
+    {
+      name: "Click Save (modal flow)",
+      skipIf: (_, c) => !!c.newCustomerCreated,
+      async run(page) {
+        const saveSel = '[data-cy="modal-submit-btn"], button:has-text("Save"), button[type="submit"]';
+        await page.locator(saveSel).first().click();
+      },
+    },
+    {
+      name: "Click Save (new customer flow)",
+      skipIf: (_, c) => !c.newCustomerCreated,
+      async run(page) {
+        await page.locator('[data-cy="save-job"], button:has-text("Schedule Appointment")').first().click();
+      },
+    },
+    {
+      name: "Wait for save to complete",
+      async run(page) {
+        await page.waitForTimeout(3000);
+      },
+    },
+    {
+      name: "Verify booking saved (modal flow)",
+      skipIf: (_, c) => !!c.newCustomerCreated,
+      async run(page, ctx) {
+        await page.waitForTimeout(1000);
+        const modalVisible = await page.locator('.modal-content, [role="dialog"]').first().isVisible();
+        if (modalVisible) {
+          // Check for visible error messages
+          const errText: string = await page.evaluate(() => {
+            const err = document.querySelector('.error, .validation-error, [class*="error"]');
+            return err ? (err.textContent || "") : "";
+          });
+          if (errText.trim()) throw new Error(`Booking failed with error: ${errText.trim()}`);
+          throw new Error("Modal still visible after save — booking may not have completed");
+        }
+        ctx.bookingSaved = true;
+      },
+    },
+    {
+      name: "Verify booking saved (new customer flow)",
+      skipIf: (_, c) => !c.newCustomerCreated,
+      async run(_page, ctx) {
+        await _page.waitForTimeout(2000);
+        ctx.bookingSaved = true;
+      },
+    },
+
+    // =========================================================================
+    // COMPLETION REPORT
+    // =========================================================================
+    {
+      name: "Generate completion report",
+      async run(_page, ctx) {
+        const time = ctx.selectedTimeSlot || I.appointmentTime;
+        let msg = `Booking successful for ${I.firstName} ${I.lastName} at ${I.serviceAddress} on ${I.appointmentDate} at ${time}.`;
+        if (ctx.newAddressAdded) msg += `\nNote: New address was added to customer profile.`;
+        if (ctx.timeSlotDiffers) msg += `\nNote: Requested time "${I.appointmentTime}" unavailable. Booked "${time}" instead.`;
+        console.log(`\n🎉 ${msg}`);
+        ctx.completionMessage = msg;
+      },
+    },
   ];
 }
 
 // =============================================================================
 // EXPORTED FUNCTION — called by server.ts
 // =============================================================================
+
 export async function runBookingTask(input: any) {
   const INPUTS = {
     stratablueEmail: process.env.STRATABLUE_EMAIL || "mcc@stratablue.com",
@@ -468,7 +1136,7 @@ export async function runBookingTask(input: any) {
     ageOfHome: input.ageOfHome || "Not Provided",
     ageOfEquipment: input.ageOfEquipment || "Not Provided",
     messageForTeam: input.messageForTeam || "Not Provided",
-    callOutcome: input.callOutcome || "Not Provided Call",
+    callOutcome: input.callOutcome || "Not Provided",
     callId: input.callId || "Not Provided",
   };
 
@@ -483,7 +1151,6 @@ export async function runBookingTask(input: any) {
     verbose: DEBUG ? 2 : 1,
     disablePino: !DEBUG,
   });
-  stagehandRef = stagehand;
 
   let sessionUrl = "";
 
@@ -495,9 +1162,12 @@ export async function runBookingTask(input: any) {
     const page = stagehand.context.pages()[0];
 
     for (let i = 0; i < STEPS.length; i++) {
-      const result = await runStep(STEPS[i], page, context, i + 1);
-      results.push({ step: STEPS[i].name, ...result });
-      if (!result.success) { console.log(`🛑 Stopped at step ${i + 1}: ${STEPS[i].name}`); break; }
+      const ok = await runStep(STEPS[i], page, context, stagehand, i + 1);
+      results.push({ step: STEPS[i].name, success: ok });
+      if (!ok) {
+        console.log(`🛑 Stopped at step ${i + 1}: ${STEPS[i].name}`);
+        break;
+      }
     }
   } catch (error: any) {
     console.error(`❌ Fatal error: ${error.message}`);
@@ -510,7 +1180,7 @@ export async function runBookingTask(input: any) {
   return {
     success: results.every(r => r.success),
     stepsRun: results.filter(r => r.success).length,
-    stepsSkipped: results.filter(r => r.skipped).length,
+    stepsSkipped: results.filter(r => (r as any).skipped).length,
     totalSteps: STEPS.length,
     elapsedMinutes: parseFloat(elapsed),
     sessionUrl,
