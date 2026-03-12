@@ -341,17 +341,17 @@ function buildSteps(I: any): Step[] {
               try {
                 await page.goto(`https://misterquik.sera.tech/customers/${idMatch[1]}`, {
                   waitUntil: "domcontentloaded",
-                  timeout: 100000,
+                  timeout: 60000,
                 });
               } catch {
                 // waitForMainLoadState can time out on slow SPAs — ignore and wait
                 console.log(`    ℹ️  goto timed out — waiting for page to settle`);
-                await page.waitForTimeout(100000);
+                await page.waitForTimeout(5000);
               }
             } else {
               await clickNth(page, "table tbody tr a", i);
             }
-            await page.waitForTimeout(100000);
+            await page.waitForTimeout(5000);
             ctx.customerFound = true;
             return;
           }
@@ -372,7 +372,7 @@ function buildSteps(I: any): Step[] {
         }
         const phoneSel = await firstVisible(page, ['th.phone-field input', 'th[class*="phone"] input']);
         if (phoneSel) await page.locator(phoneSel).first().fill(I.phone);
-        await page.waitForTimeout(100000);
+        await page.waitForTimeout(10000);
       },
     },
     {
@@ -582,18 +582,63 @@ function buildSteps(I: any): Step[] {
       name: "Add customer tag",
       skipIf: (_, c) => alreadyFound(c),
       async run(page) {
+        // Check if tag is already applied — if so, skip
+        const alreadyApplied = await page.evaluate((tag: string) => {
+          const pills = Array.from(document.querySelectorAll(".tag-pill, .tag-label, [class*='tag']"));
+          return pills.some(el => el.textContent?.includes(tag));
+        }, I.customerTag);
+        if (alreadyApplied) {
+          console.log(`    ℹ️  Tag "${I.customerTag}" already applied`);
+          return;
+        }
+
         await page.locator("i.tag-menu-btn").first().click();
         await page.waitForTimeout(1000);
-        await waitUntilVisible(page, 'sera-input input[placeholder="Create or Select Tag"]', 5000);
-        await page.locator('sera-input input[placeholder="Create or Select Tag"]').first().fill(I.customerTag);
+
+        const tagInputSel = 'sera-input input[placeholder="Create or Select Tag"], input[placeholder="Create or Select Tag"]';
+        await waitUntilVisible(page, tagInputSel, 5000);
+        await page.locator(tagInputSel).first().fill(I.customerTag);
         await page.waitForTimeout(2000);
-        // Click matching tag label via evaluate
-        await page.evaluate((tag: string) => {
-          const labels = Array.from(document.querySelectorAll("span.tag-label"));
-          const match = labels.find(el => el.textContent?.includes(tag)) as HTMLElement;
-          if (match) match.click();
-          else throw new Error(`Tag label "${tag}" not found`);
+
+        // Try clicking matching option via evaluate — multiple fallbacks
+        const clicked = await page.evaluate((tag: string) => {
+          // Priority 1: dropdown option list items
+          const optionSelectors = [
+            ".tag-option", ".tag-item", ".select-option",
+            "[class*=\"dropdown\"] [class*=\"option\"]",
+            "[class*=\"dropdown\"] [class*=\"item\"]",
+          ];
+          for (const sel of optionSelectors) {
+            const match = Array.from(document.querySelectorAll(sel)).find(
+              el => el.textContent?.includes(tag) && (el as HTMLElement).offsetParent !== null
+            ) as HTMLElement;
+            if (match) { match.click(); return "option"; }
+          }
+          // Priority 2: span.tag-label
+          const label = Array.from(document.querySelectorAll("span.tag-label")).find(
+            el => el.textContent?.includes(tag) && (el as HTMLElement).offsetParent !== null
+          ) as HTMLElement;
+          if (label) { label.click(); return "span.tag-label"; }
+
+          // Priority 3: any visible li/span containing the tag text
+          const any = Array.from(document.querySelectorAll("li, span, div, button")).find(
+            el =>
+              el.textContent?.trim().includes(tag) &&
+              (el as HTMLElement).offsetParent !== null &&
+              (el as HTMLElement).clientHeight > 0 &&
+              (el as HTMLElement).clientWidth < 400
+          ) as HTMLElement;
+          if (any) { any.click(); return "generic"; }
+          return null;
         }, I.customerTag);
+
+        if (clicked) {
+          console.log(`    ℹ️  Tag selected via "${clicked}"`);
+        } else {
+          // Last resort: press Enter to create/confirm the tag
+          console.log(`    ⚠️  Tag dropdown item not found — pressing Enter to create/confirm`);
+          await page.locator(tagInputSel).first().press("Enter");
+        }
         await page.waitForTimeout(500);
       },
     },
