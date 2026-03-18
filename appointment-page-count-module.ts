@@ -56,23 +56,17 @@ export async function getAppointmentPageCount(input: { dateFilter: string }): Pr
     }
     console.log(`    ✅ Logged in → ${loginUrl}`);
 
-// ==================== STEP 2: NAVIGATE TO APPOINTMENTS ====================
-console.log("  → Navigate to Appointments");
-    
-// Go directly to appointment list (skip Reports page to avoid timeout)
-// Try the direct URL first
-await page.goto("https://misterquik.sera.tech/reports/appointments", { waitUntil: "load", timeoutMs: 60000 });
-await page.waitForTimeout(5000);
+    // ==================== STEP 2: NAVIGATE TO APPOINTMENTS ====================
+    console.log("  → Navigate to Appointments");
+    await page.goto("https://misterquik.sera.tech/reports", { waitUntil: "domcontentloaded", timeoutMs: 30000 });
+    await page.waitForTimeout(3000);
 
-// If that didn't work (wrong URL), try via Reports page
-const currentUrl = page.url();
-if (!currentUrl.includes("appointment")) {
-  console.log("    ℹ️  Direct URL didn't work, navigating via Reports...");
-  await page.goto("https://misterquik.sera.tech/reports", { waitUntil: "load", timeoutMs: 60000 });
-  await page.waitForTimeout(5000);
-  await stagehandRef_act(stagehand, "click on Appointment List");
-  await page.waitForTimeout(5000);
-}
+    // Click "Appointment List" link
+    await stagehandRef_act(stagehand, "click on Appointment List");
+    await page.waitForTimeout(5000);
+
+    const reportsUrl = page.url();
+    console.log(`    ✅ On: ${reportsUrl}`);
 
     // ==================== STEP 3: APPLY FILTERS VIA URL ====================
     console.log(`  → Applying filters: date=${dateFilter}, status=completed`);
