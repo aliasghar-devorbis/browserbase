@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { declineQuotesOnPage } from "./decline-quotes-module.js";
 import express from "express";
 import { runBookingTask } from "./browserbase-booking-task-module.js";
 import { getAppointmentPageCount } from "./appointment-page-count-module.js";
@@ -62,10 +63,35 @@ app.post("/appointment-pages", authCheck, async (req, res) => {
   }
 });
 
+app.post("/decline-quotes", authCheck, async (req, res) => {
+  const { dateFilter, pageNumber } = req.body;
+  if (!dateFilter || !pageNumber) {
+    res.status(400).json({ error: "Missing required fields: dateFilter, pageNumber" });
+    return;
+  }
+  console.log(`\n📥 Decline quotes: page=${pageNumber}, dateFilter=${dateFilter}`);
+  try {
+    const result = await declineQuotesOnPage({ dateFilter, pageNumber });
+    console.log(`📤 Result: ${result.status} — ${result.result}`);
+    res.json({
+      data: {
+        status: result.status,
+        result: result.result,
+        jobsProcessed: result.jobsProcessed,
+        quotesDeclined: result.quotesDeclined,
+      },
+    });
+  } catch (error: any) {
+    console.error(`❌ Failed: ${error.message}`);
+    res.status(500).json({ data: { status: "FAILED", result: error.message } });
+  }
+});
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 API running on port ${PORT}`);
   console.log(`   POST /book               — run a booking`);
   console.log(`   POST /appointment-pages   — get appointment page count`);
+  console.log(`   POST /decline-quotes      — decline quotes on a page`);
   console.log(`   GET  /health             — health check`);
 });
