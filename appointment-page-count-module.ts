@@ -65,49 +65,69 @@ export async function getAppointmentPageCount(input: { dateFilter: string }): Pr
     // ==================== STEP 3: GET TOTAL PAGE COUNT ====================
     console.log("  → Reading page count");
 
-    const pageCount = await page.evaluate(() => {
+    const result = await page.evaluate(() => {
       const allText = document.body.innerText;
 
-      // Method 1: "Page X of Y"
-      const pageOfMatch = allText.match(/Page\s+\d+\s+of\s+(\d+)/i);
-      if (pageOfMatch) return parseInt(pageOfMatch[1], 10);
+      // Method 1: Calculate from "Showing X - Y of Z" (most accurate)
+      // Matches: "Showing 1 - 25 of 144" or "Showing 1-25 of 144"
+      const showingMatch = allText.match(/Showing\s+(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)/i);
+      if (showingMatch) {
+        const from = parseInt(showingMatch[1], 10);
+        const to = parseInt(showingMatch[2], 10);
+        const total = parseInt(showingMatch[3], 10);
+        const perPage = to - from + 1;
+        if (perPage > 0 && total > 0) {
+          const pages = Math.ceil(total / perPage);
+          return { pages, total, perPage, method: "showing-x-of-y" };
+        }
+      }
 
-      // Method 2: Highest numbered pagination button
-      const paginationBtns = document.querySelectorAll('.pagination a, .pagination button, .paginate_button, [class*="page"] a, [class*="page"] button');
+      // Method 2: Find highest numbered page link in Sera's pagination
+      // Sera uses: ul.pagination > li.dt-paging-button > a.page-link
+      const pageLinks = document.querySelectorAll('ul.pagination a.page-link, .dt-paging-button a, .page-item a');
       let maxPage = 0;
-      for (const btn of paginationBtns) {
-        const num = parseInt(btn.textContent?.trim() || "", 10);
+      for (const link of pageLinks) {
+        const text = link.textContent?.trim() || "";
+        // Extract number, handling ">6" or "6" format
+        const num = parseInt(text.replace(/[^0-9]/g, ""), 10);
         if (!isNaN(num) && num > maxPage) maxPage = num;
       }
-      if (maxPage > 0) return maxPage;
+      if (maxPage > 0) return { pages: maxPage, total: 0, perPage: 0, method: "pagination-buttons" };
 
-      // Method 3: "Showing X to Y of Z"
-      const showingMatch = allText.match(/Showing\s+\d+\s*[-–to]+\s*(\d+)\s+of\s+(\d+)/i);
-      if (showingMatch) {
-        const perPage = parseInt(showingMatch[1], 10);
-        const total = parseInt(showingMatch[2], 10);
-        if (perPage > 0 && total > 0) return Math.ceil(total / perPage);
+      // Method 3: Check data-dt-idx attributes (Sera DataTables specific)
+      const dtBtns = document.querySelectorAll('[data-dt-idx]');
+      let maxIdx = 0;
+      for (const btn of dtBtns) {
+        const idx = parseInt(btn.getAttribute("data-dt-idx") || "0", 10);
+        // data-dt-idx is 0-based for page buttons, but also includes prev/next
+        // The page number in the text is more reliable
+        const text = btn.textContent?.trim() || "";
+        const num = parseInt(text.replace(/[^0-9]/g, ""), 10);
+        if (!isNaN(num) && num > maxIdx) maxIdx = num;
       }
+      if (maxIdx > 0) return { pages: maxIdx, total: 0, perPage: 0, method: "data-dt-idx" };
 
-      // Method 4: Numbered page links
-      const pageLinks = document.querySelectorAll('a[href*="page="], a[data-page], li.page-item a');
+      // Method 4: Generic fallback
+      const genericBtns = document.querySelectorAll('.pagination a, .pagination button, .paginate_button');
       let max2 = 0;
-      for (const link of pageLinks) {
-        const num = parseInt(link.textContent?.trim() || "", 10);
+      for (const btn of genericBtns) {
+        const num = parseInt(btn.textContent?.trim() || "", 10);
         if (!isNaN(num) && num > max2) max2 = num;
       }
-      if (max2 > 0) return max2;
+      if (max2 > 0) return { pages: max2, total: 0, perPage: 0, method: "generic-pagination" };
 
-      return 0;
+      return { pages: 0, total: 0, perPage: 0, method: "none" };
     });
 
+    console.log(`    ℹ️  Method: ${result.method}, Pages: ${result.pages}, Total: ${result.total}, PerPage: ${result.perPage}`);
+
     let resultMessage: string;
-    if (pageCount > 0) {
-      resultMessage = `Total pages found: ${pageCount}`;
+    if (result.pages > 0) {
+      resultMessage = `Total pages found: ${result.pages}`;
     } else {
-      console.log("    ℹ️  DOM extraction didn't find page count, trying AI extract...");
+      console.log("    ℹ️  DOM extraction failed, trying AI extract...");
       const extracted = await stagehand.extract(
-        "Look at the bottom of the table/page. Find the pagination or page count. How many total pages are there? Return just the number."
+        "Look at the bottom of the page. There is text like 'Showing 1 - 25 of 144' and pagination buttons. How many total pages are there? Calculate: total items divided by items per page, rounded up. Return just the number."
       );
       const aiText = typeof extracted === "string" ? extracted : JSON.stringify(extracted);
       const numMatch = aiText.match(/(\d+)/);
