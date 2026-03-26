@@ -3,8 +3,8 @@ import { declineQuotesOnPage } from "./decline-quotes-module.js";
 import express from "express";
 import { runBookingTask } from "./browserbase-booking-task-module.js";
 import { getAppointmentPageCount } from "./appointment-page-count-module.js";
-import { runMembershipTask } from "./active-membership-module.js";
-import { runQBOBatchTask } from "./qbo-batch-module.js";
+import { runMembershipTask } from "./active-membership-server.js";
+import { runQBOBatchTask } from "./qbo-batch-server.js";
 import crypto from "crypto";
 
 const app = express();
