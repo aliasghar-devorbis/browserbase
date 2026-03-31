@@ -286,11 +286,12 @@ export async function declineQuotesOnPage(input: {
       log.info(`──────────────────────────────────────`);
       log.info(`Processing job`, { jobId });
 
+      let newPage: any = null;
       try {
         const jobQuotesUrl = `https://misterquik.sera.tech/jobs/${jobId}?tab=jp_Quotes`;
         log.info(`Opening Quotes tab in new browser tab`, { jobQuotesUrl });
 
-        const newPage = await stagehand.context.newPage();
+        newPage = await stagehand.context.newPage();
         try {
           await newPage.goto(jobQuotesUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
         } catch {
@@ -500,7 +501,6 @@ export async function declineQuotesOnPage(input: {
           errors.push(`Job ${jobId}: Hit safety limit of ${MAX_QUOTES_PER_JOB} quotes per job`);
         }
 
-        await newPage.close();
         log.success(`Job complete`, { jobId, quotesDeclined: quotesOnThisJob });
         jobsProcessed++;
 
@@ -512,11 +512,17 @@ export async function declineQuotesOnPage(input: {
         errors.push(errMsg);
         jobsProcessed++;
 
-        // Clean up extra tabs
-        const allPages = stagehand.context.pages();
-        while (allPages.length > 1) {
-          try { await allPages[allPages.length - 1].close(); } catch {}
-          allPages.pop();
+      } finally {
+        // ALWAYS close the job tab — no matter what happened above.
+        // Leaving tabs open wastes Browserbase CPU/RAM and slows every
+        // subsequent job. With try/finally this is guaranteed even on errors.
+        if (newPage) {
+          try {
+            await newPage.close();
+            log.info(`Tab closed`, { jobId });
+          } catch (closeErr: any) {
+            log.warn(`Could not close tab (may already be closed)`, { jobId, error: (closeErr as any).message });
+          }
         }
       }
     }
